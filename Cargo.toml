@@ -8,4 +8,6 @@ edition = "2018"
 [dependencies]
 rdma-cm = {path = "../rdma-cm"}
 nix = "0.21"
+
+[dev-dependencies]
 structopt = { version = "0.3", default-features = false }
