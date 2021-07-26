@@ -23,7 +23,36 @@ pub struct QueueDescriptor {
 
 /// Connection data transmitted through the private data struct fields by our `connect` and `accept`
 /// function to set up one-sided RDMA. (u64, u32) are (address of volatile_send_window, rkey).
-type ConnectionData = (u64, u32);
+type PrivateData = (u64, u32);
+
+/// TODO: Move to own module. This should only be created from ControlFlow::create_connection_data
+/// Since the volatile_send_window should be registered.
+struct ConnectionData {
+    volatile_send_window: Box<u64>,
+    mr: MemoryRegion,
+}
+
+impl ConnectionData {
+    /// Several steps are necessary to connect both sides for one-sided RDMA control flow.
+    /// This is the first step. Registers memory the other side will write to.
+    /// TODO: Move this method to ConnectionData?
+    fn new(pd: &mut ProtectionDomain) -> ConnectionData {
+        let mut volatile_send_window = Box::new(0);
+
+        let mr = unsafe { CommunicatioManager::register_memory(pd, &mut volatile_send_window) };
+        ConnectionData {
+            volatile_send_window,
+            mr,
+        }
+    }
+
+    fn as_private_data(&self) -> PrivateData {
+        (
+            self.volatile_send_window.as_ref() as *const _ as u64,
+            self.mr.get_rkey(),
+        )
+    }
+}
 
 struct ControlFlow {
     /// Amount of allocated buffers left for receive requests.
@@ -38,28 +67,20 @@ struct ControlFlow {
     /// The `volatile_send_window` is registered with the RDMA device. This is the memory region
     /// corresponding to that registration.
     mr: MemoryRegion,
+    /// Information required to communicate with other side.
+    other_side: PrivateData,
 }
 
 impl ControlFlow {
-    fn new(pd: &mut ProtectionDomain) -> ControlFlow {
-        let mut volatile_send_window = Box::new(0);
-
-        let mr = unsafe { CommunicatioManager::register_memory(pd, &mut volatile_send_window) };
-        let mut cf = ControlFlow {
+    fn new(our_conn_data: ConnectionData, their_conn_data: PrivateData) -> ControlFlow {
+        ControlFlow {
             remaining_receive_window: RECV_BUFFERS,
+            // Other side will allocata same number of buffers we do.
             remaining_send_window: RECV_BUFFERS,
-            volatile_send_window,
-            mr,
-        };
-
-        cf
-    }
-
-    fn get_connection_data(&self) -> ConnectionData {
-        (
-            self.volatile_send_window.as_ref() as *const _ as u64,
-            self.mr.get_rkey(),
-        )
+            volatile_send_window: our_conn_data.volatile_send_window,
+            mr: our_conn_data.mr,
+            other_side: their_conn_data,
+        }
     }
 }
 
@@ -133,18 +154,21 @@ impl IoQueue {
         qd.completion_queue = Some(cq);
         qd.queue_pair = Some(qp);
 
-        qd.control_flow = Some(ControlFlow::new(qd.protection_domain.as_mut().unwrap()));
-
-        let client_conn_data = &qd.control_flow.as_ref().unwrap().get_connection_data();
-        dbg!(client_conn_data);
-
-        qd.cm.connect::<ConnectionData>(Some(client_conn_data));
+        let client_conn_data = ConnectionData::new(qd.protection_domain.as_mut().unwrap());
+        let our_private_data = &client_conn_data.as_private_data();
+        dbg!(our_private_data);
+        qd.cm.connect::<PrivateData>(Some(our_private_data));
         let event = qd.cm.get_cm_event();
         assert_eq!(RdmaCmEvent::Established, event.get_event());
 
         // Server sent us its send_window. Let's save it somewhere.
-        let server_conn_data = event.get_private_data::<ConnectionData>();
+        let server_conn_data = event
+            .get_private_data::<PrivateData>()
+            .expect("Private data missing!");
         dbg!(server_conn_data);
+
+        let control_flow = ControlFlow::new(client_conn_data, server_conn_data);
+        qd.control_flow = Some(control_flow);
     }
 
     fn resolve_address(qd: &mut QueueDescriptor) {
@@ -184,24 +208,27 @@ impl IoQueue {
 
         // New connection established! Use this  connection for RDMA communication.
         let mut connected_id = event.get_connection_request_id();
-        let client_conn_data = event.get_private_data::<ConnectionData>();
-        dbg!(client_conn_data);
+        let client_private_data = event
+            .get_private_data::<PrivateData>()
+            .expect("Missing private data!");
+        dbg!(client_private_data);
         event.ack();
 
         let mut pd = connected_id.allocate_pd();
         let cq = connected_id.create_cq();
         let qp = connected_id.create_qp(&pd, &cq);
 
-        let mut control_flow = ControlFlow::new(&mut pd);
+        let mut our_conn_data = ConnectionData::new(&mut pd);
 
         // Now send our connection data to client.
-        let server_conn_data = &control_flow.get_connection_data();
-        dbg!(server_conn_data);
-        connected_id.accept(Some(server_conn_data));
+        let our_private_data = &our_conn_data.as_private_data();
+        dbg!(our_private_data);
+        connected_id.accept(Some(our_private_data));
         let event = qd.cm.get_cm_event();
         assert_eq!(RdmaCmEvent::Established, event.get_event());
         event.ack();
 
+        let control_flow = ControlFlow::new(our_conn_data, client_private_data);
         QueueDescriptor {
             cm: connected_id,
             protection_domain: Some(pd),
