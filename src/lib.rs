@@ -1,131 +1,60 @@
-use nix::sys::socket::SockAddr;
-use rdma_cm;
-use rdma_cm::{CommunicatioManager, CompletionQueue, MemoryRegion, ProtectionDomain, RdmaCmEvent};
 use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
 
-mod scheduler;
+use nix::sys::socket::SockAddr;
+use rdma_cm;
+use rdma_cm::{
+    CommunicatioManager, CompletionQueue, MemoryRegion, ProtectionDomain, RdmaCmEvent,
+    RegisteredMemoryRef,
+};
+
+use crate::executor::{Executor, QueueToken, TaskHandle};
+use control_flow::{ConnectionData, ControlFlow, PrivateData};
+use std::ffi::c_void;
+
+mod control_flow;
+mod executor;
+mod utils;
+mod waker;
+
+use tracing::{info, Level};
 
 /// Number of receive buffers to allocate per connection. This constant is also used when allocating
 /// new buffers.
-const RECV_BUFFERS: u32 = 1024;
+const RECV_BUFFERS: u64 = 1024;
 
 pub struct QueueDescriptor {
     cm: rdma_cm::CommunicatioManager,
-
     // TODO a better API could avoid having these as options
-    protection_domain: Option<rdma_cm::ProtectionDomain>,
-    queue_pair: Option<rdma_cm::QueuePair>,
-    completion_queue: Option<rdma_cm::CompletionQueue>,
-    /// Initialized only when connection is made.
-    control_flow: Option<ControlFlow>,
-}
-
-/// Connection data transmitted through the private data struct fields by our `connect` and `accept`
-/// function to set up one-sided RDMA. (u64, u32) are (address of volatile_send_window, rkey).
-type PrivateData = (u64, u32);
-
-/// TODO: Move to own module. This should only be created from ControlFlow::create_connection_data
-/// Since the volatile_send_window should be registered.
-struct ConnectionData {
-    volatile_send_window: Box<u64>,
-    mr: MemoryRegion,
-}
-
-impl ConnectionData {
-    /// Several steps are necessary to connect both sides for one-sided RDMA control flow.
-    /// This is the first step. Registers memory the other side will write to.
-    /// TODO: Move this method to ConnectionData?
-    fn new(pd: &mut ProtectionDomain) -> ConnectionData {
-        let mut volatile_send_window = Box::new(0);
-
-        let mr = unsafe { CommunicatioManager::register_memory(pd, &mut volatile_send_window) };
-        ConnectionData {
-            volatile_send_window,
-            mr,
-        }
-    }
-
-    fn as_private_data(&self) -> PrivateData {
-        (
-            self.volatile_send_window.as_ref() as *const _ as u64,
-            self.mr.get_rkey(),
-        )
-    }
-}
-
-struct ControlFlow {
-    /// Amount of allocated buffers left for receive requests.
-    remaining_receive_window: u32,
-    /// Amount of allocated buffers left on the other side.
-    remaining_send_window: u32,
-    /// Communication variable from other side.
-    /// This variable is registered with the RDMA device and may be changed by the peer at any time.
-    /// Probably needs to be made volatile in Rust... otherwise some UB might happen.
-    /// Heap allocated to ensure it doesn't move?
-    volatile_send_window: Box<u64>,
-    /// The `volatile_send_window` is registered with the RDMA device. This is the memory region
-    /// corresponding to that registration.
-    mr: MemoryRegion,
-    /// Information required to communicate with other side.
-    other_side: PrivateData,
-}
-
-impl ControlFlow {
-    fn new(our_conn_data: ConnectionData, their_conn_data: PrivateData) -> ControlFlow {
-        ControlFlow {
-            remaining_receive_window: RECV_BUFFERS,
-            // Other side will allocata same number of buffers we do.
-            remaining_send_window: RECV_BUFFERS,
-            volatile_send_window: our_conn_data.volatile_send_window,
-            mr: our_conn_data.mr,
-            other_side: their_conn_data,
-        }
-    }
-}
-
-pub struct IoQueueMemory {
-    mr: MemoryRegion,
-    mem: Box<[u8]>,
-}
-
-impl Deref for IoQueueMemory {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        self.mem.deref()
-    }
-}
-
-impl DerefMut for IoQueueMemory {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.mem.deref_mut()
-    }
+    scheduler_handle: Option<TaskHandle>,
 }
 
 pub struct IoQueue {
-    scheduler: (),
+    executor: executor::Executor<1000, 1024>,
 }
 
 impl IoQueue {
     pub fn new() -> IoQueue {
-        IoQueue { scheduler: () }
+        info!("{}", function_name!());
+        IoQueue {
+            executor: Executor::new(),
+        }
     }
     /// Initializes RDMA by fetching the device?
     /// Allocates memory regions?
     pub fn socket(&self) -> QueueDescriptor {
+        info!("{}", function_name!());
+
         let cm = rdma_cm::CommunicatioManager::new();
 
         QueueDescriptor {
             cm,
-            protection_domain: None,
-            queue_pair: None,
-            completion_queue: None,
-            control_flow: None,
+            scheduler_handle: None,
         }
     }
 
     pub fn bind(&mut self, qd: &mut QueueDescriptor, socket_address: &SockAddr) -> Result<(), ()> {
+        info!("{}", function_name!());
         qd.cm.bind(socket_address);
         Ok(())
     }
@@ -136,6 +65,8 @@ impl IoQueue {
     /// 3) Creates protection domain, completion queue, and queue pairs.
     /// 4) Establishes receive window communication.
     pub fn connect(&mut self, qd: &mut QueueDescriptor) {
+        info!("{}", function_name!());
+
         IoQueue::resolve_address(qd);
 
         // Resolve route
@@ -145,16 +76,11 @@ impl IoQueue {
         event.ack();
 
         // Allocate pd, cq, and qp.
-        let pd = qd.cm.allocate_pd();
+        let mut pd = qd.cm.allocate_pd();
         let mut cq = qd.cm.create_cq();
         let mut qp = qd.cm.create_qp(&pd, &cq);
 
-        // TODO assert these fields haven't been set in struct.
-        qd.protection_domain = Some(pd);
-        qd.completion_queue = Some(cq);
-        qd.queue_pair = Some(qp);
-
-        let client_conn_data = ConnectionData::new(qd.protection_domain.as_mut().unwrap());
+        let client_conn_data = ConnectionData::new(&mut pd);
         let our_private_data = &client_conn_data.as_private_data();
         dbg!(our_private_data);
         qd.cm.connect::<PrivateData>(Some(our_private_data));
@@ -167,11 +93,13 @@ impl IoQueue {
             .expect("Private data missing!");
         dbg!(server_conn_data);
 
-        let control_flow = ControlFlow::new(client_conn_data, server_conn_data);
-        qd.control_flow = Some(control_flow);
+        let cf = ControlFlow::new(client_conn_data, server_conn_data);
+        qd.scheduler_handle = Some(self.executor.add_new_connection(cf, qp, pd, cq));
     }
 
     fn resolve_address(qd: &mut QueueDescriptor) {
+        info!("{}", function_name!());
+
         // Get address info and resolve route!
         let addr_info = CommunicatioManager::get_addr_info();
         let mut current = addr_info;
@@ -196,12 +124,16 @@ impl IoQueue {
     }
 
     pub fn listen(&mut self, qd: &mut QueueDescriptor) {
+        info!("{}", function_name!());
+
         qd.cm.listen();
     }
 
     /// NOTE: Accept allocates a protection domain and queue descriptor internally for this id.
     /// And acks establishes connection.
     pub fn accept(&mut self, qd: &mut QueueDescriptor) -> QueueDescriptor {
+        info!("{}", function_name!());
+
         // Block until connection request arrives.
         let event = qd.cm.get_cm_event();
         assert_eq!(RdmaCmEvent::ConnectionRequest, event.get_event());
@@ -229,87 +161,54 @@ impl IoQueue {
         event.ack();
 
         let control_flow = ControlFlow::new(our_conn_data, client_private_data);
+        let scheduler_handle = self.executor.add_new_connection(control_flow, qp, pd, cq);
+
         QueueDescriptor {
             cm: connected_id,
-            protection_domain: Some(pd),
-            queue_pair: Some(qp),
-            completion_queue: Some(cq),
-            control_flow: Some(control_flow),
+            scheduler_handle: Some(scheduler_handle),
         }
     }
 
     /// Allocate memory and register it with RDMA.
     /// TODO: This function should only be called once the protection domain has been allocated.
-    pub fn malloc(&self, qd: &mut QueueDescriptor, elements: usize) -> IoQueueMemory {
-        let mut mem: Box<[u8]> = vec![0; elements].into_boxed_slice();
-        let mr = qd
-            .cm
-            .register_memory_buffer(qd.protection_domain.as_mut().unwrap(), &mut mem);
+    pub fn malloc(&mut self, qd: &mut QueueDescriptor, elements: usize) -> RegisteredMemoryRef {
+        info!("{}", function_name!());
 
-        IoQueueMemory { mr, mem }
+        // TODO Do proper error handling. This expect means the connection was never properly
+        // established via accept or connect. So we never added it to the executor.
+        self.executor
+            .malloc(qd.scheduler_handle.expect("Missing executor handle."))
     }
 
     /// We will need to use the lower level ibverbs interface to register UserArrays with
     /// RDMA on behalf of the user.
-    pub fn push<'a>(&self, qd: &'a mut QueueDescriptor, mem: IoQueueMemory) -> QueueToken<'a> {
-        // rebind mem to make it mutable, yuck.
-        let mut mem = mem;
-        qd.queue_pair.as_mut().unwrap().post_send(&mut mem.mr, 0);
+    /// TODO: If user drops QueueToken we will be pointing to dangling memory... We should reference
+    /// count he memory ourselves...
+    pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RegisteredMemoryRef) -> QueueToken {
+        info!("{}", function_name!());
 
-        QueueToken {
-            mem,
-            completion_queue: qd.completion_queue.as_mut().unwrap(),
-            work_request_id: 0,
-        }
+        self.executor.push(qd.scheduler_handle.unwrap(), mem)
     }
 
     /// TODO: Bad things will happen if queue token is dropped as the memory registered with
     /// RDMA will be deallocated.
-    pub fn pop<'a>(&self, qd: &'a mut QueueDescriptor) -> QueueToken<'a> {
-        // TODO: When should post received messages be put on the qp? Only when the programmers
-        // calls pop? Or should we preemptively set some.
+    pub fn pop(&mut self, qd: &mut QueueDescriptor) -> QueueToken {
+        info!("{}", function_name!());
 
-        // TODO: When is the right time to allocate receive buffers? Only when the user calls pop?
-        // I doubt it. Registering memory with the device is expensive and requires a kernel
-        // context switch.
-        let mut mem: Box<[u8]> = vec![0; 1000].into_boxed_slice();
-
-        let mut mr = qd.cm.register_memory_buffer(
-            qd.protection_domain.as_ref().expect("Pd not initialized"),
-            &mut mem,
-        );
-
-        // TODO set up windows for flow control between both sides.
-        // TODO Count work request ids.
-        qd.queue_pair
-            .as_mut()
-            .expect("qp not initialized")
-            .post_receive(&mut mr, 0);
-        QueueToken {
-            mem: IoQueueMemory { mr, mem },
-            completion_queue: qd.completion_queue.as_ref().expect("cq not initialized"),
-            work_request_id: 0,
-        }
+        let mem = self.malloc(qd, 1000);
+        self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
-    pub fn wait(&self, qt: QueueToken) -> IoQueueMemory {
+    pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemoryRef {
+        info!("{}", function_name!());
         loop {
-            match qt.completion_queue.poll() {
-                None => {}
-                Some(entries) => {
-                    // TODO do not drop other entries lol.
-                    for e in entries {
-                        assert_eq!(qt.work_request_id, e.wr_id, "Incorrect work request id.");
-                        return qt.mem;
-                    }
+            self.executor.service_completion_queue(qt);
+            match self.executor.wait(qt) {
+                None => {
+                    // TODO Have scheduler schedule relevant tasks.
                 }
+                Some(memory) => return memory,
             }
         }
     }
-}
-
-pub struct QueueToken<'a> {
-    mem: IoQueueMemory,
-    completion_queue: &'a CompletionQueue,
-    work_request_id: u64,
 }

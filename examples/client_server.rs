@@ -2,6 +2,7 @@ use io_queue_rdma::IoQueue;
 use nix::sys::socket::{InetAddr, IpAddr, SockAddr};
 use std::str::FromStr;
 use structopt::StructOpt;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug)]
 enum Mode {
@@ -32,6 +33,12 @@ struct Opt {
 }
 
 fn main() {
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .without_time()
+        .init();
+
     let opt = Opt::from_args();
     match opt.mode {
         Mode::Server => {

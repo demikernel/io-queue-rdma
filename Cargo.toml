@@ -7,7 +7,9 @@ edition = "2018"
 
 [dependencies]
 rdma-cm = {path = "../rdma-cm"}
+tracing = "0.1.26"
 nix = "0.21"
 
 [dev-dependencies]
 structopt = { version = "0.3", default-features = false }
+tracing-subscriber = "0.2.19"
