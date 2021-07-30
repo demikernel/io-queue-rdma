@@ -50,17 +50,19 @@ pub struct ControlFlow {
     mr: MemoryRegion,
     /// Information required to communicate with other side.
     other_side: PrivateData,
+    pub(crate) batch_size: u64,
 }
 
 impl ControlFlow {
     pub fn new(our_conn_data: ConnectionData, their_conn_data: PrivateData) -> ControlFlow {
         ControlFlow {
-            remaining_receive_window: RECV_BUFFERS,
+            remaining_receive_window: 0,
             // Other side will allocate same number of buffers we do.
             remaining_send_window: RECV_BUFFERS,
             volatile_send_window: our_conn_data.volatile_send_window,
             mr: our_conn_data.mr,
             other_side: their_conn_data,
+            batch_size: RECV_BUFFERS,
         }
     }
 
@@ -68,7 +70,31 @@ impl ControlFlow {
         self.remaining_send_window > 0
     }
 
-    pub fn get_avaliable_entries(&self) -> u64 {
+    /// Returns true if remaining send windows is less that 1/4 its original size.
+    pub fn subtract_remaining_send_windows(&mut self) -> bool {
+        self.remaining_send_window += 1;
+        self.remaining_send_window < RECV_BUFFERS / 4
+    }
+
+    pub fn remaining_send_window(&self) -> u64 {
         self.remaining_send_window
+    }
+
+    pub fn remaining_send_windows(&self) -> u64 {
+        self.remaining_send_window
+    }
+
+    pub fn remaining_receive_windows(&self) -> u64 {
+        self.remaining_receive_window
+    }
+
+    pub fn subtract_recv_windows(&mut self, how_many: u64) {
+        assert!(self.remaining_receive_window >= how_many);
+        self.remaining_receive_window -= how_many;
+    }
+
+    pub fn add_recv_windows(&mut self, how_many: u64) {
+        tracing::info!("{} new recive windows allocated!", how_many);
+        self.remaining_receive_window += how_many;
     }
 }

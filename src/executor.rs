@@ -1,11 +1,12 @@
-use std::borrow::Borrow;
-use std::cell::{Ref, RefCell};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
+
+#[allow(unused_imports)]
 use tracing::{debug, info, span, trace, Level};
 
 use crate::function_name;
@@ -16,7 +17,7 @@ use rdma_cm::{
 
 use crate::control_flow::ControlFlow;
 use std::cmp::min;
-use std::ptr::slice_from_raw_parts_mut;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 pub(crate) struct Executor<const N: usize, const SIZE: usize> {
     tasks: Vec<ConnectionTask>,
@@ -34,23 +35,23 @@ pub struct TaskHandle(usize);
 // Every connection has a push, pop, completion_queue, (and more) coroutines. A ControlFlow handle
 // and
 struct ConnectionTask {
-    memory_pool: Vec<RegisteredMemoryRef>,
+    memory_pool: Rc<RefCell<VecDeque<RegisteredMemoryRef>>>,
     protection_domain: ProtectionDomain,
 
     push_coroutine: Pin<Box<dyn Future<Output = ()>>>,
-    pop_coroutine: Pin<Box<dyn Future<Output = ()>>>,
+    recv_buffers_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
 
-    // pop_task: Pin<dyn Future<Output = ()>>,
-    // alloc_memory_task: Box<dyn Future<Output = ()>>,
-    // receive_buffer_task: Box<dyn Future<Output = ()>>,
     push_work_queue: Rc<RefCell<VecDeque<WorkRequest>>>,
     pop_work_queue: Rc<RefCell<VecDeque<WorkRequest>>>,
 
     processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemoryRef>>>,
     completed_requests: Rc<RefCell<HashSet<u64>>>,
 
-    work_id_counter: u64,
+    next_pop_work_id: Receiver<u64>,
+
+    control_flow: Rc<RefCell<ControlFlow>>,
+    work_id_counter: Rc<RefCell<u64>>,
 }
 
 impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
@@ -61,7 +62,6 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         }
     }
 
-    /// TODO: Change usize to proper type.
     pub fn add_new_connection(
         &mut self,
         control_flow: ControlFlow,
@@ -74,8 +74,10 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         let push_work_queue = Rc::new(RefCell::new(VecDeque::with_capacity(1000)));
         let pop_work_queue = Rc::new(RefCell::new(VecDeque::with_capacity(1000)));
 
+        let (ready_pop_work_id, next_pop_work_id) = std::sync::mpsc::channel::<u64>();
+
         let processed_requests = Rc::new(RefCell::new(HashMap::with_capacity(1000)));
-        let completed_push_requests = Rc::new(RefCell::new(HashSet::with_capacity(1000)));
+        let completed_requests = Rc::new(RefCell::new(HashSet::with_capacity(1000)));
 
         let control_flow = Rc::new(RefCell::new(control_flow));
         let queue_pair = Rc::new(RefCell::new(queue_pair));
@@ -101,19 +103,22 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         //     }
         // }
 
-        let mut memory_pool: Vec<RegisteredMemoryRef> = Vec::with_capacity(N);
-        for n in 0..N {
-            let mut memory = vec![0 as u8; N * SIZE].into_boxed_slice();
+        // Allocate four times as many vectors as our
+        let mut memory_pool: VecDeque<RegisteredMemoryRef> = VecDeque::with_capacity(N);
+        for _ in 0..4 * N {
+            let mut memory = vec![0 as u8; N as usize * SIZE].into_boxed_slice();
             let registered_memory =
                 CommunicatioManager::register_memory_buffer(&mut protection_domain, &mut memory);
-            memory_pool.push(RegisteredMemoryRef::new(
+            memory_pool.push_back(RegisteredMemoryRef::new(
                 registered_memory.get_lkey(),
                 memory,
             ));
         }
+        let work_id_counter = Rc::new(RefCell::new(0));
+        let memory_pool = Rc::new(RefCell::new(memory_pool));
 
-        let ct = ConnectionTask {
-            memory_pool,
+        let mut ct = ConnectionTask {
+            memory_pool: memory_pool.clone(),
             protection_domain,
             push_coroutine: Box::pin(push_coroutine(
                 queue_pair.clone(),
@@ -121,22 +126,32 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
                 control_flow.clone(),
                 processed_requests.clone(),
             )),
-            pop_coroutine: Box::pin(pop_coroutine(
-                queue_pair.clone(),
-                pop_work_queue.clone(),
+            recv_buffers_coroutine: Box::pin(post_receive_coroutine(
+                queue_pair,
                 control_flow.clone(),
+                memory_pool,
                 processed_requests.clone(),
+                work_id_counter.clone(),
+                ready_pop_work_id,
             )),
             completions_coroutine: Box::pin(completions_coroutine(
+                control_flow.clone(),
                 completion_queue,
-                completed_push_requests.clone(),
+                completed_requests.clone(),
             )),
             push_work_queue,
             pop_work_queue,
             processed_requests,
-            completed_requests: completed_push_requests,
-            work_id_counter: 0,
+            completed_requests,
+            next_pop_work_id,
+            control_flow,
+            work_id_counter,
         };
+
+        info!("Starting coroutines.");
+        Self::schedule(&mut ct.recv_buffers_coroutine);
+        // Self::schedule(&mut ct.push_coroutine);
+        // Self::schedule(&mut ct.completions_coroutine);
 
         let current_task_id = self.tasks.len();
         self.tasks.push(ct);
@@ -150,7 +165,8 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
             .get_mut(task.0)
             .expect(&format!("Missing task {:?}", task))
             .memory_pool
-            .pop()
+            .borrow_mut()
+            .pop_front()
             .expect("Out of memory!")
     }
 
@@ -159,15 +175,17 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
 
         let task: &mut ConnectionTask = self.tasks.get_mut(task_handle.0).unwrap();
 
-        let work_id = task.work_id_counter;
+        let work_id: u64 = task.work_id_counter.borrow_mut().clone();
+
+        *task.work_id_counter.borrow_mut() += 1;
         let work = WorkRequest {
             memory: mem,
             work_id,
         };
-        task.work_id_counter += 1;
-
         task.push_work_queue.borrow_mut().push_back(work);
+        // TODO: Is push coroutine called too often?
         Executor::<N, SIZE>::schedule(&mut task.push_coroutine);
+
         QueueToken {
             work_id,
             task_id: task_handle,
@@ -177,15 +195,20 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     pub fn pop(&mut self, task_handle: TaskHandle) -> QueueToken {
         info!("{}", function_name!());
 
-        let memory = self.malloc(task_handle);
         let task: &mut ConnectionTask = self.tasks.get_mut(task_handle.0).unwrap();
 
-        let work_id = task.work_id_counter;
-        let work = WorkRequest { memory, work_id };
+        let work_id = match task.next_pop_work_id.try_recv() {
+            Ok(work_id) => work_id,
+            Err(TryRecvError::Empty) => {
+                // Allocate more recv buffers.
+                Self::schedule(&mut task.recv_buffers_coroutine);
+                task.next_pop_work_id
+                    .try_recv()
+                    .expect("Could not allocate more recv buffers")
+            }
+            Err(TryRecvError::Disconnected) => panic!("next_pop_work_id disconnected"),
+        };
 
-        task.work_id_counter += 1;
-        task.pop_work_queue.borrow_mut().push_back(work);
-        Executor::<N, SIZE>::schedule(&mut task.pop_coroutine);
         QueueToken {
             work_id,
             task_id: task_handle,
@@ -203,7 +226,8 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
 
     pub fn service_completion_queue(&mut self, qt: QueueToken) {
         let task: &mut ConnectionTask = self.tasks.get_mut(qt.task_id.0).unwrap();
-        Executor::<N, SIZE>::schedule(&mut task.completions_coroutine);
+        Self::schedule(&mut task.completions_coroutine);
+        Self::schedule(&mut task.recv_buffers_coroutine);
     }
 
     pub fn wait(&mut self, qt: QueueToken) -> Option<RegisteredMemoryRef> {
@@ -253,7 +277,7 @@ impl Future for SendWindows {
     type Output = u64;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        match self.control_flow.borrow_mut().get_avaliable_entries() {
+        match self.control_flow.borrow_mut().remaining_send_windows() {
             0 => Poll::Pending,
             n => Poll::Ready(n),
         }
@@ -289,7 +313,7 @@ async fn push_coroutine(
         let range = min(work_requests.len(), send_windows as usize);
         s.in_scope(|| trace!("Sending {} requests.", range));
 
-        let mut requests_to_send: VecDeque<WorkRequest> = work_requests.drain(..range).collect();
+        let requests_to_send: VecDeque<WorkRequest> = work_requests.drain(..range).collect();
         let mut mrs = requests_to_send.iter().map(|pw| (pw.work_id, &pw.memory));
 
         queue_pairs.borrow_mut().post_send(&mut mrs);
@@ -304,48 +328,90 @@ async fn push_coroutine(
     }
 }
 
-async fn pop_coroutine(
-    queue_pairs: Rc<RefCell<QueuePair>>,
-    pop_work: Rc<RefCell<VecDeque<WorkRequest>>>,
+struct RemainingReceiveWindows {
     control_flow: Rc<RefCell<ControlFlow>>,
-    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemoryRef>>>,
-) {
-    let s = span!(Level::INFO, "pop_coroutine");
-    s.in_scope(|| trace!("started!"));
+}
 
-    // TODO Allocate more receive windows if needed?
-    loop {
-        let new_work = WorkRequestQueue {
-            work_requests: pop_work.clone(),
-        }
-        .await;
-        s.in_scope(|| trace!("{} new work to pop.", new_work.len()));
-        let mut receive_requests = new_work.iter().map(|pw| (pw.work_id, &pw.memory));
+/// Pending until more send windows are allocated by other side.
+impl Future for RemainingReceiveWindows {
+    type Output = u64;
 
-        queue_pairs.borrow_mut().post_receive(&mut receive_requests);
-
-        let mut processed_pop_requests = processed_requests.borrow_mut();
-        for WorkRequest { memory, work_id } in new_work {
-            assert!(
-                processed_pop_requests.insert(work_id, memory).is_none(),
-                "duplicate entry"
-            );
+    fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let cf = self.control_flow.deref().borrow();
+        match cf.remaining_receive_windows() {
+            0 => Poll::Ready(cf.batch_size),
+            n => Poll::Pending,
         }
     }
 }
 
+async fn post_receive_coroutine(
+    queue_pair: Rc<RefCell<QueuePair>>,
+    control_flow: Rc<RefCell<ControlFlow>>,
+    memory_pool: Rc<RefCell<VecDeque<RegisteredMemoryRef>>>,
+    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemoryRef>>>,
+    work_id_counter: Rc<RefCell<u64>>,
+    ready_pop_work_id: Sender<u64>,
+) {
+    let s = span!(Level::INFO, "post_receive_coroutine");
+    s.in_scope(|| trace!("started!"));
+
+    loop {
+        let how_many = RemainingReceiveWindows {
+            control_flow: control_flow.clone(),
+        }
+        .await;
+        s.in_scope(|| trace!("Allocating {} new receive buffers.!", how_many));
+        let receive_buffers: Vec<RegisteredMemoryRef> = (0..how_many)
+            .map(|_| memory_pool.borrow_mut().pop_front().expect("Out of memory"))
+            .collect();
+
+        let work_id: u64 = work_id_counter.deref().borrow().clone();
+        let to_post_recv = receive_buffers
+            .iter()
+            .enumerate()
+            .map(|(i, memory)| (i as u64 + work_id, memory));
+
+        queue_pair.borrow_mut().post_receive(to_post_recv);
+
+        s.in_scope(|| {
+            trace!(
+                "Work ids {} through {} are ready.",
+                work_id,
+                work_id + how_many
+            )
+        });
+        for n in work_id..work_id + how_many {
+            ready_pop_work_id.send(n).unwrap();
+        }
+
+        let mut processed_requests = processed_requests.borrow_mut();
+        for (i, memory) in receive_buffers.into_iter().enumerate() {
+            processed_requests.insert(i as u64 + work_id, memory);
+        }
+
+        control_flow.borrow_mut().add_recv_windows(how_many);
+        *work_id_counter.borrow_mut() += how_many;
+    }
+}
+
 async fn completions_coroutine(
+    control_flow: Rc<RefCell<ControlFlow>>,
     cq: Rc<RefCell<CompletionQueue>>,
-    completed_push_requests: Rc<RefCell<HashSet<u64>>>,
+    completed_requests: Rc<RefCell<HashSet<u64>>>,
 ) -> () {
     let s = span!(Level::INFO, "completions_coroutine");
     s.in_scope(|| trace!("started!"));
 
     loop {
         let completed = AsyncCompletionQueue { cq: cq.clone() }.await;
+
         s.in_scope(|| trace!("{} events completed!.", completed.len()));
 
-        let mut completed_requests = completed_push_requests.borrow_mut();
+        let mut completed_requests = completed_requests.borrow_mut();
+        control_flow
+            .borrow_mut()
+            .subtract_recv_windows(completed_requests.len() as u64);
         for c in completed {
             completed_requests.insert(c.wr_id);
         }
