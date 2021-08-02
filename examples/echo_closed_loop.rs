@@ -26,8 +26,8 @@ impl FromStr for Mode {
 
 #[derive(Debug, StructOpt)]
 #[structopt(
-    name = "IoQueue Client/Server",
-    about = "Example IOQueue RDMA Client/Server Program."
+    name = "Echo closed loop latency experiment.",
+    about = "Computes latency of sending data in loopback between two processes over RDMA IoQueue."
 )]
 struct Opt {
     #[structopt(short, long)]
@@ -116,33 +116,32 @@ fn main() {
                 running += roundtrip_time.elapsed().as_micros();
 
                 io_queue.free(&mut connection, memory);
-
-                println!(
-                    "Roundtrip latency over {} runs = {}us",
-                    opt.loops,
-                    (running as f64) / (opt.loops as f64)
-                );
-                println!(
-                    "Push latency over {} runs = {}us",
-                    opt.loops,
-                    (push as f64) / (opt.loops as f64)
-                );
-                println!(
-                    "Push-wait latency over {} runs = {}us",
-                    opt.loops,
-                    (push_wait as f64) / (opt.loops as f64)
-                );
-                println!(
-                    "Pop latency over {} runs = {}us",
-                    opt.loops,
-                    (pop as f64) / (opt.loops as f64)
-                );
-                println!(
-                    "Pop-wait latency over {} runs = {}us",
-                    opt.loops,
-                    (pop_wait as f64) / (opt.loops as f64)
-                );
             }
+            println!(
+                "Roundtrip latency over {} runs = {}us",
+                opt.loops,
+                (running as f64) / (opt.loops as f64)
+            );
+            println!(
+                "Push latency over {} runs = {}us",
+                opt.loops,
+                (push as f64) / (opt.loops as f64)
+            );
+            println!(
+                "Push-wait latency over {} runs = {}us",
+                opt.loops,
+                (push_wait as f64) / (opt.loops as f64)
+            );
+            println!(
+                "Pop latency over {} runs = {}us",
+                opt.loops,
+                (pop as f64) / (opt.loops as f64)
+            );
+            println!(
+                "Pop-wait latency over {} runs = {}us",
+                opt.loops,
+                (pop_wait as f64) / (opt.loops as f64)
+            );
         }
     }
 }
