@@ -1,7 +1,7 @@
 use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
 
-use nix::sys::socket::SockAddr;
+use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::{
     CommunicatioManager, CompletionQueue, MemoryRegion, ProtectionDomain, RdmaCmEvent,
@@ -21,7 +21,7 @@ use tracing::{info, Level};
 
 /// Number of receive buffers to allocate per connection. This constant is also used when allocating
 /// new buffers.
-const RECV_BUFFERS: u64 = 1024;
+const RECV_BUFFERS: u64 = 128;
 
 pub struct QueueDescriptor {
     cm: rdma_cm::CommunicatioManager,
@@ -30,7 +30,7 @@ pub struct QueueDescriptor {
 }
 
 pub struct IoQueue {
-    executor: executor::Executor<1000, 1024>,
+    executor: executor::Executor<{ RECV_BUFFERS as usize }, 1>,
 }
 
 impl IoQueue {
@@ -64,10 +64,10 @@ impl IoQueue {
     /// 2) resolves route.
     /// 3) Creates protection domain, completion queue, and queue pairs.
     /// 4) Establishes receive window communication.
-    pub fn connect(&mut self, qd: &mut QueueDescriptor) {
+    pub fn connect(&mut self, qd: &mut QueueDescriptor, address: InetAddr) {
         info!("{}", function_name!());
 
-        IoQueue::resolve_address(qd);
+        IoQueue::resolve_address(qd, address);
 
         // Resolve route
         qd.cm.resolve_route(0);
@@ -97,19 +97,17 @@ impl IoQueue {
         qd.scheduler_handle = Some(self.executor.add_new_connection(cf, qp, pd, cq));
     }
 
-    fn resolve_address(qd: &mut QueueDescriptor) {
+    fn resolve_address(qd: &mut QueueDescriptor, address: InetAddr) {
         info!("{}", function_name!());
 
         // Get address info and resolve route!
-        let addr_info = CommunicatioManager::get_addr_info();
+        let addr_info = CommunicatioManager::get_addr_info(address);
         let mut current = addr_info;
 
         while current != null_mut() {
-            println!("Client: Resolving address...");
             let ret = qd.cm.resolve_addr(None, (unsafe { *current }).ai_dst_addr);
 
             if ret == 0 {
-                println!("Client: Address resolved.");
                 break;
             }
             unsafe {
@@ -169,15 +167,25 @@ impl IoQueue {
         }
     }
 
-    /// Allocate memory and register it with RDMA.
+    /// Fetch a buffer from our pre-allocated memory pool.
     /// TODO: This function should only be called once the protection domain has been allocated.
-    pub fn malloc(&mut self, qd: &mut QueueDescriptor, elements: usize) -> RegisteredMemoryRef {
+    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemoryRef {
         info!("{}", function_name!());
 
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
         self.executor
             .malloc(qd.scheduler_handle.expect("Missing executor handle."))
+    }
+
+    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemoryRef) {
+        info!("{}", function_name!());
+        // TODO Do proper error handling. This expect means the connection was never properly
+        // established via accept or connect. So we never added it to the executor.
+        self.executor.free(
+            qd.scheduler_handle.expect("Missing executor handle."),
+            memory,
+        );
     }
 
     /// We will need to use the lower level ibverbs interface to register UserArrays with
@@ -194,8 +202,6 @@ impl IoQueue {
     /// RDMA will be deallocated.
     pub fn pop(&mut self, qd: &mut QueueDescriptor) -> QueueToken {
         info!("{}", function_name!());
-
-        let mem = self.malloc(qd, 1000);
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 

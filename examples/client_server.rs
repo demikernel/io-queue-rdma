@@ -1,5 +1,6 @@
 use io_queue_rdma::IoQueue;
 use nix::sys::socket::{InetAddr, IpAddr, SockAddr};
+use std::net::SocketAddr;
 use std::str::FromStr;
 use structopt::StructOpt;
 use tracing_subscriber::EnvFilter;
@@ -30,6 +31,10 @@ impl FromStr for Mode {
 struct Opt {
     #[structopt(short, long)]
     mode: Mode,
+    #[structopt(short, long)]
+    ip_address: String,
+    #[structopt(short, long)]
+    port: u16,
 }
 
 fn main() {
@@ -45,8 +50,12 @@ fn main() {
             let mut io_queue = IoQueue::new();
             let mut listening_qd = io_queue.socket();
 
-            let addr = SockAddr::Inet(InetAddr::new(IpAddr::new_v4(127, 0, 0, 1), 4000));
-            io_queue.bind(&mut listening_qd, &addr);
+            let address = format!("{}:{}", opt.ip_address, opt.port);
+            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
+            io_queue.bind(
+                &mut listening_qd,
+                &SockAddr::new_inet(InetAddr::from_std(&address)),
+            );
             io_queue.listen(&mut listening_qd);
             let mut connected_qd = io_queue.accept(&mut listening_qd);
             println!("Connected to client!");
@@ -59,10 +68,13 @@ fn main() {
         Mode::Client => {
             let mut io_queue = IoQueue::new();
             let mut connection = io_queue.socket();
-            io_queue.connect(&mut connection);
+
+            let address = format!("{}:{}", opt.ip_address, opt.port);
+            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
+            io_queue.connect(&mut connection, InetAddr::from_std(&address));
 
             println!("Sending byte to server.");
-            let mut mem = io_queue.malloc(&mut connection, 1);
+            let mut mem = io_queue.malloc(&mut connection);
             mem[0] = 42;
             let qt = io_queue.push(&mut connection, mem);
             // Acquire our allocated memory again.

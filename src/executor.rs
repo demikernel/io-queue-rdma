@@ -170,6 +170,16 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
             .expect("Out of memory!")
     }
 
+    // TODO Make sure this buffer actually belongs to this handle?
+    pub fn free(&mut self, task: TaskHandle, memory: RegisteredMemoryRef) {
+        self.tasks
+            .get_mut(task.0)
+            .expect(&format!("Missing task {:?}", task))
+            .memory_pool
+            .borrow_mut()
+            .push_back(memory)
+    }
+
     pub fn push(&mut self, task_handle: TaskHandle, mem: RegisteredMemoryRef) -> QueueToken {
         info!("{}", function_name!());
 
@@ -184,7 +194,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         };
         task.push_work_queue.borrow_mut().push_back(work);
         // TODO: Is push coroutine called too often?
-        Executor::<N, SIZE>::schedule(&mut task.push_coroutine);
+        Self::schedule(&mut task.push_coroutine);
 
         QueueToken {
             work_id,
@@ -200,6 +210,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         let work_id = match task.next_pop_work_id.try_recv() {
             Ok(work_id) => work_id,
             Err(TryRecvError::Empty) => {
+                debug!("Allocating more receive buffers.");
                 // Allocate more recv buffers.
                 Self::schedule(&mut task.recv_buffers_coroutine);
                 task.next_pop_work_id
@@ -405,16 +416,21 @@ async fn completions_coroutine(
 
     loop {
         let completed = AsyncCompletionQueue { cq: cq.clone() }.await;
-
         s.in_scope(|| trace!("{} events completed!.", completed.len()));
 
+        let mut recv_requests_completed = 0;
         let mut completed_requests = completed_requests.borrow_mut();
-        control_flow
-            .borrow_mut()
-            .subtract_recv_windows(completed_requests.len() as u64);
         for c in completed {
+            info!("Work completion status: {}", c.status);
+            if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RECV {
+                recv_requests_completed += 1;
+            }
             completed_requests.insert(c.wr_id);
         }
+
+        control_flow
+            .borrow_mut()
+            .subtract_recv_windows(recv_requests_completed);
     }
 }
 
