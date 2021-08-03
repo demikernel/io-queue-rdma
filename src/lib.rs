@@ -1,11 +1,9 @@
-use std::ops::{Deref, DerefMut};
 use std::ptr::null_mut;
 
 use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm;
 use rdma_cm::{
-    CommunicatioManager, CompletionQueue, MemoryRegion, ProtectionDomain, RdmaCmEvent,
-    RegisteredMemoryRef,
+    CommunicationManager, CompletionQueue, ProtectionDomain, RdmaCmEvent, RegisteredMemory,
 };
 
 use crate::executor::{Executor, QueueToken, TaskHandle};
@@ -24,7 +22,7 @@ use tracing::{info, Level};
 const RECV_BUFFERS: u64 = 128;
 
 pub struct QueueDescriptor {
-    cm: rdma_cm::CommunicatioManager,
+    cm: rdma_cm::CommunicationManager,
     // TODO a better API could avoid having these as options
     scheduler_handle: Option<TaskHandle>,
 }
@@ -45,7 +43,7 @@ impl IoQueue {
     pub fn socket(&self) -> QueueDescriptor {
         info!("{}", function_name!());
 
-        let cm = rdma_cm::CommunicatioManager::new();
+        let cm = rdma_cm::CommunicationManager::new().expect("TODO");
 
         QueueDescriptor {
             cm,
@@ -71,20 +69,20 @@ impl IoQueue {
 
         // Resolve route
         qd.cm.resolve_route(0);
-        let event = qd.cm.get_cm_event();
+        let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::RouteResolved, event.get_event());
         event.ack();
 
         // Allocate pd, cq, and qp.
-        let mut pd = qd.cm.allocate_pd();
-        let mut cq = qd.cm.create_cq();
+        let mut pd = qd.cm.allocate_protection_domain().expect("TODO");
+        let mut cq = qd.cm.create_cq(100).expect("TODO");
         let mut qp = qd.cm.create_qp(&pd, &cq);
 
         let client_conn_data = ConnectionData::new(&mut pd);
-        let our_private_data = &client_conn_data.as_private_data();
-        dbg!(our_private_data);
-        qd.cm.connect::<PrivateData>(Some(our_private_data));
-        let event = qd.cm.get_cm_event();
+        // let our_private_data = &client_conn_data.as_private_data();
+        // dbg!(our_private_data);
+        qd.cm.connect::<PrivateData>(None);
+        let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::Established, event.get_event());
 
         // Server sent us its send_window. Let's save it somewhere.
@@ -101,7 +99,7 @@ impl IoQueue {
         info!("{}", function_name!());
 
         // Get address info and resolve route!
-        let addr_info = CommunicatioManager::get_addr_info(address);
+        let addr_info = CommunicationManager::get_address_info(address).expect("TODO");
         let mut current = addr_info;
 
         while current != null_mut() {
@@ -116,7 +114,7 @@ impl IoQueue {
         }
 
         // Ack address resolution.
-        let event = qd.cm.get_cm_event();
+        let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::AddressResolved, event.get_event());
         event.ack();
     }
@@ -133,7 +131,7 @@ impl IoQueue {
         info!("{}", function_name!());
 
         // Block until connection request arrives.
-        let event = qd.cm.get_cm_event();
+        let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::ConnectionRequest, event.get_event());
 
         // New connection established! Use this  connection for RDMA communication.
@@ -144,17 +142,17 @@ impl IoQueue {
         dbg!(client_private_data);
         event.ack();
 
-        let mut pd = connected_id.allocate_pd();
-        let cq = connected_id.create_cq();
+        let mut pd = connected_id.allocate_protection_domain().expect("TODO");
+        let cq = connected_id.create_cq(100).expect("TODO");
         let qp = connected_id.create_qp(&pd, &cq);
 
         let mut our_conn_data = ConnectionData::new(&mut pd);
 
         // Now send our connection data to client.
-        let our_private_data = &our_conn_data.as_private_data();
-        dbg!(our_private_data);
-        connected_id.accept(Some(our_private_data));
-        let event = qd.cm.get_cm_event();
+        // let our_private_data = &our_conn_data.as_private_data();
+        // dbg!(our_private_data);
+        connected_id.accept::<()>(None);
+        let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::Established, event.get_event());
         event.ack();
 
@@ -169,7 +167,7 @@ impl IoQueue {
 
     /// Fetch a buffer from our pre-allocated memory pool.
     /// TODO: This function should only be called once the protection domain has been allocated.
-    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemoryRef {
+    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemory<[u8]> {
         info!("{}", function_name!());
 
         // TODO Do proper error handling. This expect means the connection was never properly
@@ -178,7 +176,7 @@ impl IoQueue {
             .malloc(qd.scheduler_handle.expect("Missing executor handle."))
     }
 
-    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemoryRef) {
+    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemory<[u8]>) {
         info!("{}", function_name!());
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
@@ -192,7 +190,7 @@ impl IoQueue {
     /// RDMA on behalf of the user.
     /// TODO: If user drops QueueToken we will be pointing to dangling memory... We should reference
     /// count he memory ourselves...
-    pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RegisteredMemoryRef) -> QueueToken {
+    pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RegisteredMemory<[u8]>) -> QueueToken {
         info!("{}", function_name!());
 
         self.executor.push(qd.scheduler_handle.unwrap(), mem)
@@ -205,7 +203,7 @@ impl IoQueue {
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemoryRef {
+    pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemory<[u8]> {
         info!("{}", function_name!());
         loop {
             self.executor.service_completion_queue(qt);

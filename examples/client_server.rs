@@ -52,18 +52,20 @@ fn main() {
 
             let address = format!("{}:{}", opt.ip_address, opt.port);
             let address: SocketAddr = address.parse().expect("Unable to parse socket address");
-            io_queue.bind(
-                &mut listening_qd,
-                &SockAddr::new_inet(InetAddr::from_std(&address)),
-            );
+            io_queue
+                .bind(
+                    &mut listening_qd,
+                    &SockAddr::new_inet(InetAddr::from_std(&address)),
+                )
+                .unwrap();
             io_queue.listen(&mut listening_qd);
             let mut connected_qd = io_queue.accept(&mut listening_qd);
             println!("Connected to client!");
 
             println!("Waiting to receive byte...");
             let qt = io_queue.pop(&mut connected_qd);
-            let buffer = io_queue.wait(qt);
-            println!("Server got: {:?}", buffer[0]);
+            let mut buffer = io_queue.wait(qt);
+            println!("Server got: {:?}", buffer.as_mut_slice(1)[0]);
         }
         Mode::Client => {
             let mut io_queue = IoQueue::new();
@@ -75,10 +77,11 @@ fn main() {
 
             println!("Sending byte to server.");
             let mut mem = io_queue.malloc(&mut connection);
-            mem[0] = 42;
+            mem.as_mut_slice(1)[0] = 42;
             let qt = io_queue.push(&mut connection, mem);
             // Acquire our allocated memory again.
-            let mem = io_queue.wait(qt);
+            let memory = io_queue.wait(qt);
+            io_queue.free(&mut connection, memory);
             println!("Byte sent!");
         }
     }

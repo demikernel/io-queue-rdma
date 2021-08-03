@@ -56,10 +56,12 @@ fn main() {
 
             let address = format!("{}:{}", opt.loopback_address, opt.port);
             let address: SocketAddr = address.parse().expect("Unable to parse socket address");
-            io_queue.bind(
-                &mut listening_qd,
-                &SockAddr::new_inet(InetAddr::from_std(&address)),
-            );
+            io_queue
+                .bind(
+                    &mut listening_qd,
+                    &SockAddr::new_inet(InetAddr::from_std(&address)),
+                )
+                .unwrap();
             io_queue.listen(&mut listening_qd);
             let mut connected_qd = io_queue.accept(&mut listening_qd);
 
@@ -92,7 +94,7 @@ fn main() {
 
             for _ in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);
-                memory[0] = 42;
+                memory.as_mut_slice(1)[0] = 42;
 
                 let roundtrip_time = Instant::now();
 
