@@ -9,7 +9,7 @@ pub type PrivateData = (u64, u32);
 /// TODO: Move to own module. This should only be created from ControlFlow::create_connection_data
 /// Since the volatile_send_window should be registered.
 pub struct ConnectionData {
-    memory: RegisteredMemory<u64>,
+    memory: RegisteredMemory<[u64; 1]>,
 }
 
 impl ConnectionData {
@@ -17,9 +17,9 @@ impl ConnectionData {
     /// This is the first step. Registers memory the other side will write to.
     /// TODO: Move this method to ConnectionData?
     pub fn new(pd: &mut ProtectionDomain) -> ConnectionData {
-        let mut volatile_send_window = Box::new(0);
+        let mut volatile_send_window: Box<[u64; 1]> = Box::new([0]);
 
-        let memory = unsafe { pd.register_memory(volatile_send_window) };
+        let memory = unsafe { pd.register_array(volatile_send_window) };
         ConnectionData { memory }
     }
 
@@ -41,10 +41,7 @@ pub struct ControlFlow {
     /// This variable is registered with the RDMA device and may be changed by the peer at any time.
     /// Probably needs to be made volatile in Rust... otherwise some UB might happen.
     /// Heap allocated to ensure it doesn't move?
-    volatile_send_window: Box<u64>,
-    /// The `volatile_send_window` is registered with the RDMA device. This is the memory region
-    /// corresponding to that registration.
-    mr: RegisteredMemory<u64>,
+    //volatile_send_window: RegisteredMemory<[u64; 1]>,
     /// Information required to communicate with other side.
     other_side: PrivateData,
     pub(crate) batch_size: u64,
@@ -56,8 +53,8 @@ impl ControlFlow {
             remaining_receive_window: 0,
             // Other side will allocate same number of buffers we do.
             remaining_send_window: RECV_BUFFERS,
-            volatile_send_window: Box::new(1), //TODO This value is garbage. Change for real value. // our_conn_data.volatile_send_window
-            mr: our_conn_data.memory,
+            // volatile_send_window: todo!(),
+            // mr: our_conn_data.memory,
             other_side: their_conn_data,
             batch_size: RECV_BUFFERS,
         }
@@ -91,7 +88,7 @@ impl ControlFlow {
     }
 
     pub fn add_recv_windows(&mut self, how_many: u64) {
-        tracing::info!("{} new recive windows allocated!", how_many);
+        tracing::info!("{} new receive windows allocated!", how_many);
         self.remaining_receive_window += how_many;
     }
 }

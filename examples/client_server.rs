@@ -45,13 +45,15 @@ fn main() {
         .init();
 
     let opt = Opt::from_args();
+
+    let address = format!("{}:{}", opt.ip_address, opt.port);
+    let address: SocketAddr = address.parse().expect("Unable to parse socket address");
+
     match opt.mode {
         Mode::Server => {
             let mut io_queue = IoQueue::new();
             let mut listening_qd = io_queue.socket();
 
-            let address = format!("{}:{}", opt.ip_address, opt.port);
-            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
             io_queue
                 .bind(
                     &mut listening_qd,
@@ -70,9 +72,6 @@ fn main() {
         Mode::Client => {
             let mut io_queue = IoQueue::new();
             let mut connection = io_queue.socket();
-
-            let address = format!("{}:{}", opt.ip_address, opt.port);
-            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
             io_queue.connect(&mut connection, InetAddr::from_std(&address));
 
             println!("Sending byte to server.");

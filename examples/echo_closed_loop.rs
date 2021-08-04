@@ -33,7 +33,7 @@ struct Opt {
     #[structopt(short, long)]
     mode: Mode,
     #[structopt(short, long)]
-    loopback_address: String,
+    ip_address: String,
     #[structopt(short, long)]
     port: u16,
     #[structopt(short, long)]
@@ -49,13 +49,13 @@ fn main() {
         .init();
 
     let opt = Opt::from_args();
+    let address = format!("{}:{}", opt.ip_address, opt.port);
+    let address: SocketAddr = address.parse().expect("Unable to parse socket address");
     match opt.mode {
         Mode::Server => {
             let mut io_queue = IoQueue::new();
             let mut listening_qd = io_queue.socket();
 
-            let address = format!("{}:{}", opt.loopback_address, opt.port);
-            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
             io_queue
                 .bind(
                     &mut listening_qd,
@@ -74,16 +74,12 @@ fn main() {
                 let qt = io_queue.push(&mut connected_qd, memory);
                 let memory = io_queue.wait(qt);
 
-                // println!("Server message echoed!");
                 io_queue.free(&mut connected_qd, memory);
             }
         }
         Mode::Client => {
             let mut io_queue = IoQueue::new();
             let mut connection = io_queue.socket();
-
-            let address = format!("{}:{}", opt.loopback_address, opt.port);
-            let address: SocketAddr = address.parse().expect("Unable to parse socket address");
             io_queue.connect(&mut connection, InetAddr::from_std(&address));
 
             let mut running: u128 = 0;
@@ -94,7 +90,9 @@ fn main() {
 
             for _ in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);
-                memory.as_mut_slice(1)[0] = 42;
+                let slice = memory.as_mut_slice(2);
+                slice[0] = 42;
+                slice[1] = 43;
 
                 let roundtrip_time = Instant::now();
 
@@ -112,36 +110,29 @@ fn main() {
                 pop += pop_time.elapsed().as_micros();
 
                 let pop_wait_time = Instant::now();
-                let memory = io_queue.wait(qt);
-                pop_wait += pop_wait_time.elapsed().as_micros();
+                let mut memory = io_queue.wait(qt);
 
+                pop_wait += pop_wait_time.elapsed().as_micros();
                 running += roundtrip_time.elapsed().as_micros();
 
+                let slice = memory.as_mut_slice(2);
+                assert_eq!(slice[0], 42);
+                assert_eq!(slice[1], 43);
                 io_queue.free(&mut connection, memory);
             }
+            println!("Latencies averaged over {} runs.", opt.loops);
             println!(
-                "Roundtrip latency over {} runs = {}us",
-                opt.loops,
+                "Total roundtrip latency: {}us",
                 (running as f64) / (opt.loops as f64)
             );
+            println!("Push latency: {}us", (push as f64) / (opt.loops as f64));
             println!(
-                "Push latency over {} runs = {}us",
-                opt.loops,
-                (push as f64) / (opt.loops as f64)
-            );
-            println!(
-                "Push-wait latency over {} runs = {}us",
-                opt.loops,
+                "Push-wait latency: {}us",
                 (push_wait as f64) / (opt.loops as f64)
             );
+            println!("Pop latency: {}us", (pop as f64) / (opt.loops as f64));
             println!(
-                "Pop latency over {} runs = {}us",
-                opt.loops,
-                (pop as f64) / (opt.loops as f64)
-            );
-            println!(
-                "Pop-wait latency over {} runs = {}us",
-                opt.loops,
+                "Pop-wait latency: {}us",
                 (pop_wait as f64) / (opt.loops as f64)
             );
         }

@@ -15,11 +15,11 @@ mod executor;
 mod utils;
 mod waker;
 
-use tracing::{info, Level};
+use tracing::{debug, info, trace, Level};
 
 /// Number of receive buffers to allocate per connection. This constant is also used when allocating
 /// new buffers.
-const RECV_BUFFERS: u64 = 128;
+const RECV_BUFFERS: u64 = 200;
 
 pub struct QueueDescriptor {
     cm: rdma_cm::CommunicationManager,
@@ -28,7 +28,7 @@ pub struct QueueDescriptor {
 }
 
 pub struct IoQueue {
-    executor: executor::Executor<{ RECV_BUFFERS as usize }, 1>,
+    executor: executor::Executor<{ RECV_BUFFERS as usize }, 2>,
 }
 
 impl IoQueue {
@@ -102,12 +102,15 @@ impl IoQueue {
         let addr_info = CommunicationManager::get_address_info(address).expect("TODO");
         let mut current = addr_info;
 
+        // TODO: This will fail if the address is never found.
         while current != null_mut() {
-            let ret = qd.cm.resolve_addr(None, (unsafe { *current }).ai_dst_addr);
-
-            if ret == 0 {
-                break;
+            match qd.cm.resolve_address((unsafe { *current }).ai_dst_addr) {
+                Ok(_) => {
+                    break;
+                }
+                Err(_) => {}
             }
+
             unsafe {
                 current = (*current).ai_next;
             }
@@ -168,7 +171,7 @@ impl IoQueue {
     /// Fetch a buffer from our pre-allocated memory pool.
     /// TODO: This function should only be called once the protection domain has been allocated.
     pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemory<[u8]> {
-        info!("{}", function_name!());
+        trace!("{}", function_name!());
 
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
@@ -177,7 +180,7 @@ impl IoQueue {
     }
 
     pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemory<[u8]>) {
-        info!("{}", function_name!());
+        trace!("{}", function_name!());
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
         self.executor.free(
@@ -191,7 +194,7 @@ impl IoQueue {
     /// TODO: If user drops QueueToken we will be pointing to dangling memory... We should reference
     /// count he memory ourselves...
     pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RegisteredMemory<[u8]>) -> QueueToken {
-        info!("{}", function_name!());
+        trace!("{}", function_name!());
 
         self.executor.push(qd.scheduler_handle.unwrap(), mem)
     }
@@ -199,12 +202,12 @@ impl IoQueue {
     /// TODO: Bad things will happen if queue token is dropped as the memory registered with
     /// RDMA will be deallocated.
     pub fn pop(&mut self, qd: &mut QueueDescriptor) -> QueueToken {
-        info!("{}", function_name!());
+        trace!("{}", function_name!());
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
     pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemory<[u8]> {
-        info!("{}", function_name!());
+        trace!("{}", function_name!());
         loop {
             self.executor.service_completion_queue(qt);
             match self.executor.wait(qt) {
