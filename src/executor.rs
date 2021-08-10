@@ -11,9 +11,7 @@ use tracing::{debug, info, span, trace, Level};
 
 use crate::function_name;
 
-use rdma_cm::{
-    CommunicationManager, CompletionQueue, ProtectionDomain, QueuePair, RegisteredMemory,
-};
+use rdma_cm::{CompletionQueue, ProtectionDomain, QueuePair, RegisteredMemory};
 
 use crate::control_flow::ControlFlow;
 use std::cmp::min;
@@ -21,7 +19,7 @@ use std::collections::hash_map::Entry;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 pub(crate) struct Executor<const N: usize, const SIZE: usize> {
-    tasks: Vec<ConnectionTask>,
+    tasks: Vec<ConnectionTask<SIZE>>,
 }
 
 #[derive(Copy, Clone)]
@@ -46,17 +44,17 @@ enum CompletedRequestType {
 
 // TODO: Currently we must make sure the protection domain is declared last as we need to deallocate
 // all other registered memory before deallocating protection domain. How to fix this?
-struct ConnectionTask {
+struct ConnectionTask<const SIZE: usize> {
     recv_buffers_coroutine: Pin<Box<dyn Future<Output = ()>>>,
 
-    memory_pool: Rc<RefCell<VecDeque<RegisteredMemory<[u8]>>>>,
+    memory_pool: Rc<RefCell<VecDeque<RegisteredMemory<u8, SIZE>>>>,
     push_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
 
-    push_work_queue: Rc<RefCell<VecDeque<WorkRequest>>>,
-    pop_work_queue: Rc<RefCell<VecDeque<WorkRequest>>>,
+    push_work_queue: Rc<RefCell<VecDeque<WorkRequest<SIZE>>>>,
+    pop_work_queue: Rc<RefCell<VecDeque<WorkRequest<SIZE>>>>,
 
-    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemory<[u8]>>>>,
+    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemory<u8, SIZE>>>>,
     completed_requests: Rc<RefCell<HashMap<u64, CompletedRequestType>>>,
 
     next_pop_work_id: Receiver<u64>,
@@ -64,6 +62,14 @@ struct ConnectionTask {
     control_flow: Rc<RefCell<ControlFlow>>,
     work_id_counter: Rc<RefCell<u64>>,
     protection_domain: ProtectionDomain,
+}
+
+fn vec_to_boxed_array<T: Copy, const N: usize>(val: T) -> Box<[T; N]> {
+    let boxed_slice = vec![val; N].into_boxed_slice();
+
+    let ptr = Box::into_raw(boxed_slice) as *mut [T; N];
+
+    unsafe { Box::from_raw(ptr) }
 }
 
 impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
@@ -116,10 +122,9 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         // }
 
         // Allocate four times as many vectors as our
-        let mut memory_pool: VecDeque<RegisteredMemory<[u8]>> = VecDeque::with_capacity(N);
+        let mut memory_pool: VecDeque<RegisteredMemory<u8, SIZE>> = VecDeque::with_capacity(N);
         for _ in 0..2 * N {
-            let mut memory = vec![0 as u8; N as usize * SIZE].into_boxed_slice();
-            let memory = protection_domain.register_slice(memory);
+            let memory = protection_domain.register_array(vec_to_boxed_array::<u8, SIZE>(0));
             memory_pool.push_back(memory);
         }
         let work_id_counter = Rc::new(RefCell::new(0));
@@ -166,35 +171,42 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         TaskHandle(current_task_id)
     }
 
-    pub fn malloc(&mut self, task: TaskHandle) -> RegisteredMemory<[u8]> {
+    pub fn malloc(&mut self, task: TaskHandle) -> RegisteredMemory<u8, SIZE> {
         trace!("{}", function_name!());
 
-        self.tasks
+        let mut memory_pool = self
+            .tasks
             .get_mut(task.0)
             .expect(&format!("Missing task {:?}", task))
             .memory_pool
-            .borrow_mut()
-            .pop_front()
-            .expect("Out of memory!")
+            .borrow_mut();
+        trace!("Malloc: Entries in memory pool: {}", memory_pool.len());
+        memory_pool.pop_front().expect("Out of memory!")
     }
 
     // TODO Make sure this buffer actually belongs to this handle?
-    pub fn free(&mut self, task: TaskHandle, mut memory: RegisteredMemory<[u8]>) {
+    pub fn free(&mut self, task: TaskHandle, mut memory: RegisteredMemory<u8, SIZE>) {
         trace!("{}", function_name!());
 
         memory.reset_access();
-        self.tasks
+        let mut memory_pool = self
+            .tasks
             .get_mut(task.0)
             .expect(&format!("Missing task {:?}", task))
             .memory_pool
-            .borrow_mut()
-            .push_back(memory)
+            .borrow_mut();
+        trace!("Free: Entries in memory pool: {}", memory_pool.len());
+        memory_pool.push_back(memory)
     }
 
-    pub fn push(&mut self, task_handle: TaskHandle, memory: RegisteredMemory<[u8]>) -> QueueToken {
+    pub fn push(
+        &mut self,
+        task_handle: TaskHandle,
+        memory: RegisteredMemory<u8, SIZE>,
+    ) -> QueueToken {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask = self.tasks.get_mut(task_handle.0).unwrap();
+        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(task_handle.0).unwrap();
 
         let work_id: u64 = task.work_id_counter.borrow_mut().clone();
 
@@ -213,7 +225,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     pub fn pop(&mut self, task_handle: TaskHandle) -> QueueToken {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask = self.tasks.get_mut(task_handle.0).unwrap();
+        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(task_handle.0).unwrap();
 
         let work_id = match task.next_pop_work_id.try_recv() {
             Ok(work_id) => work_id,
@@ -246,15 +258,15 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     pub fn service_completion_queue(&mut self, qt: QueueToken) {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask = self.tasks.get_mut(qt.task_id.0).unwrap();
+        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
         Self::schedule(&mut task.completions_coroutine);
         Self::schedule(&mut task.recv_buffers_coroutine);
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> Option<RegisteredMemory<[u8]>> {
+    pub fn wait(&mut self, qt: QueueToken) -> Option<RegisteredMemory<u8, SIZE>> {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask = self.tasks.get_mut(qt.task_id.0).unwrap();
+        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
 
         match task.completed_requests.borrow_mut().entry(qt.work_id) {
             Entry::Occupied(entry) => {
@@ -276,17 +288,17 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     }
 }
 
-struct WorkRequest {
-    memory: RegisteredMemory<[u8]>,
+struct WorkRequest<const SIZE: usize> {
+    memory: RegisteredMemory<u8, SIZE>,
     work_id: u64,
 }
 
-struct WorkRequestQueue {
-    work_requests: Rc<RefCell<VecDeque<WorkRequest>>>,
+struct WorkRequestQueue<const SIZE: usize> {
+    work_requests: Rc<RefCell<VecDeque<WorkRequest<SIZE>>>>,
 }
 
-impl Future for WorkRequestQueue {
-    type Output = VecDeque<WorkRequest>;
+impl<const SIZE: usize> Future for WorkRequestQueue<SIZE> {
+    type Output = VecDeque<WorkRequest<SIZE>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut push_work = self.work_requests.borrow_mut();
@@ -308,23 +320,28 @@ impl Future for SendWindows {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.control_flow.borrow_mut().remaining_send_windows() {
-            0 => Poll::Pending,
+            // Our local variable shows we have exhausted the send windows. Check if other side
+            // has allocated more
+            0 => {
+                info!("Out of send windows. Checking if other side has allocated more...");
+                Poll::Pending
+            }
             n => Poll::Ready(n),
         }
     }
 }
 
 // Note: Make sure you don't hold RefCells across yield points.
-async fn push_coroutine(
+async fn push_coroutine<const SIZE: usize>(
     queue_pairs: Rc<RefCell<QueuePair>>,
-    push_work: Rc<RefCell<VecDeque<WorkRequest>>>,
+    push_work: Rc<RefCell<VecDeque<WorkRequest<SIZE>>>>,
     control_flow: Rc<RefCell<ControlFlow>>,
-    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemory<[u8]>>>>,
+    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemory<u8, SIZE>>>>,
 ) {
     let s = span!(Level::INFO, "push_coroutine");
     s.in_scope(|| debug!("started!"));
 
-    let mut work_requests: VecDeque<WorkRequest> = VecDeque::with_capacity(1000);
+    let mut work_requests: VecDeque<WorkRequest<SIZE>> = VecDeque::with_capacity(1000);
 
     loop {
         let send_windows = SendWindows {
@@ -343,7 +360,7 @@ async fn push_coroutine(
         let range = min(work_requests.len(), send_windows as usize);
         s.in_scope(|| debug!("Sending {} requests.", range));
 
-        let requests_to_send: VecDeque<WorkRequest> = work_requests.drain(..range).collect();
+        let requests_to_send: VecDeque<WorkRequest<SIZE>> = work_requests.drain(..range).collect();
         let mut mrs = requests_to_send.iter().map(|pw| (pw.work_id, &pw.memory));
 
         queue_pairs.borrow_mut().post_send(&mut mrs);
@@ -355,6 +372,7 @@ async fn push_coroutine(
                 "duplicate entry"
             );
         }
+        // TODO Subtract send window!
     }
 }
 
@@ -375,11 +393,11 @@ impl Future for RemainingReceiveWindows {
     }
 }
 
-async fn post_receive_coroutine(
+async fn post_receive_coroutine<const SIZE: usize>(
     queue_pair: Rc<RefCell<QueuePair>>,
     control_flow: Rc<RefCell<ControlFlow>>,
-    memory_pool: Rc<RefCell<VecDeque<RegisteredMemory<[u8]>>>>,
-    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemory<[u8]>>>>,
+    memory_pool: Rc<RefCell<VecDeque<RegisteredMemory<u8, SIZE>>>>,
+    processed_requests: Rc<RefCell<HashMap<u64, RegisteredMemory<u8, SIZE>>>>,
     work_id_counter: Rc<RefCell<u64>>,
     ready_pop_work_id: Sender<u64>,
 ) {
@@ -392,7 +410,7 @@ async fn post_receive_coroutine(
         }
         .await;
         s.in_scope(|| info!("Allocating {} new receive buffers!", how_many));
-        let receive_buffers: Vec<RegisteredMemory<[u8]>> = (0..how_many)
+        let receive_buffers: Vec<RegisteredMemory<u8, SIZE>> = (0..how_many)
             .map(|_| {
                 memory_pool
                     .borrow_mut()
@@ -445,7 +463,7 @@ async fn completions_coroutine(
         let mut recv_requests_completed = 0;
         let mut completed_requests = completed_requests.borrow_mut();
         for c in completed {
-            s.in_scope(|| trace!("Work completion status for {}: {}", c.status, c.wr_id));
+            s.in_scope(|| trace!("Work completion status for {}: {}", c.wr_id, c.status));
 
             // TODO: this if/else assumes if its not a RECV it is a SEND. But there are
             // others.

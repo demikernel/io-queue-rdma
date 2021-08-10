@@ -26,8 +26,8 @@ impl FromStr for Mode {
 
 #[derive(Debug, StructOpt)]
 #[structopt(
-    name = "Echo closed loop latency experiment.",
-    about = "Computes latency of sending data in loopback between two processes over RDMA IoQueue."
+    name = "Echo RDMA server/client program.",
+    about = "Computes roundtrip latency for RDMA IoQueue Echo Server."
 )]
 struct Opt {
     #[structopt(short, long)]
@@ -76,6 +76,8 @@ fn main() {
 
                 io_queue.free(&mut connected_qd, memory);
             }
+
+            io_queue.disconnect(connected_qd);
         }
         Mode::Client => {
             let mut io_queue = IoQueue::new();
@@ -87,12 +89,14 @@ fn main() {
             let mut pop: u128 = 0;
             let mut push_wait: u128 = 0;
             let mut pop_wait: u128 = 0;
+            let fill_value = 42;
 
-            for _ in 0..opt.loops {
+            for loop_val in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);
-                let slice = memory.as_mut_slice(2);
-                slice[0] = 42;
-                slice[1] = 43;
+                let slice = memory.as_mut_slice(1000);
+                for i in 0..1000 {
+                    slice[i] = (loop_val % 255) as u8;
+                }
 
                 let roundtrip_time = Instant::now();
 
@@ -115,9 +119,11 @@ fn main() {
                 pop_wait += pop_wait_time.elapsed().as_micros();
                 running += roundtrip_time.elapsed().as_micros();
 
-                let slice = memory.as_mut_slice(2);
-                assert_eq!(slice[0], 42);
-                assert_eq!(slice[1], 43);
+                let slice = memory.as_mut_slice(1000);
+                for i in 0..1000 {
+                    assert_eq!(slice[i], (loop_val % 255) as u8);
+                }
+
                 io_queue.free(&mut connection, memory);
             }
             println!("Latencies averaged over {} runs.", opt.loops);
@@ -135,6 +141,7 @@ fn main() {
                 "Pop-wait latency: {}us",
                 (pop_wait as f64) / (opt.loops as f64)
             );
+            io_queue.disconnect(connection);
         }
     }
 }

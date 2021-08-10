@@ -7,7 +7,7 @@ use rdma_cm::{
 };
 
 use crate::executor::{Executor, QueueToken, TaskHandle};
-use control_flow::{ConnectionData, ControlFlow, PrivateData};
+use control_flow::{ControlFlow, PeerConnectionData, VolatileRecvWindow};
 use std::ffi::c_void;
 
 mod control_flow;
@@ -19,7 +19,8 @@ use tracing::{debug, info, trace, Level};
 
 /// Number of receive buffers to allocate per connection. This constant is also used when allocating
 /// new buffers.
-const RECV_BUFFERS: u64 = 200;
+const RECV_BUFFERS: u64 = 100;
+const SIZE: usize = 1000;
 
 pub struct QueueDescriptor {
     cm: rdma_cm::CommunicationManager,
@@ -28,7 +29,7 @@ pub struct QueueDescriptor {
 }
 
 pub struct IoQueue {
-    executor: executor::Executor<{ RECV_BUFFERS as usize }, 2>,
+    executor: executor::Executor<{ RECV_BUFFERS as usize }, { SIZE }>,
 }
 
 impl IoQueue {
@@ -78,20 +79,19 @@ impl IoQueue {
         let mut cq = qd.cm.create_cq(100).expect("TODO");
         let mut qp = qd.cm.create_qp(&pd, &cq);
 
-        let client_conn_data = ConnectionData::new(&mut pd);
-        // let our_private_data = &client_conn_data.as_private_data();
+        let mut our_recv_window = VolatileRecvWindow::new(&mut pd);
+        let our_private_data = &our_recv_window.as_connection_data();
         // dbg!(our_private_data);
-        qd.cm.connect::<PrivateData>(None);
+        qd.cm.connect::<PeerConnectionData>(Some(our_private_data));
+
         let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::Established, event.get_event());
 
         // Server sent us its send_window. Let's save it somewhere.
-        let server_conn_data = event
-            .get_private_data::<PrivateData>()
-            .expect("Private data missing!");
-        dbg!(server_conn_data);
+        let peer: PeerConnectionData = event.get_private_data().expect("Private data missing!");
+        dbg!(peer);
 
-        let cf = ControlFlow::new(client_conn_data, server_conn_data);
+        let cf = ControlFlow::new(our_recv_window, peer);
         qd.scheduler_handle = Some(self.executor.add_new_connection(cf, qp, pd, cq));
     }
 
@@ -103,9 +103,11 @@ impl IoQueue {
         let mut current = addr_info;
 
         // TODO: This will fail if the address is never found.
+        let mut address_resolved = false;
         while current != null_mut() {
             match qd.cm.resolve_address((unsafe { *current }).ai_dst_addr) {
                 Ok(_) => {
+                    address_resolved = true;
                     break;
                 }
                 Err(_) => {}
@@ -115,7 +117,9 @@ impl IoQueue {
                 current = (*current).ai_next;
             }
         }
-
+        if !address_resolved {
+            panic!("Unable to resolve address {:?}", address);
+        }
         // Ack address resolution.
         let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::AddressResolved, event.get_event());
@@ -140,7 +144,7 @@ impl IoQueue {
         // New connection established! Use this  connection for RDMA communication.
         let mut connected_id = event.get_connection_request_id();
         let client_private_data = event
-            .get_private_data::<PrivateData>()
+            .get_private_data::<PeerConnectionData>()
             .expect("Missing private data!");
         dbg!(client_private_data);
         event.ack();
@@ -149,17 +153,17 @@ impl IoQueue {
         let cq = connected_id.create_cq(100).expect("TODO");
         let qp = connected_id.create_qp(&pd, &cq);
 
-        let mut our_conn_data = ConnectionData::new(&mut pd);
-
         // Now send our connection data to client.
-        // let our_private_data = &our_conn_data.as_private_data();
+        let mut volatile_recv_window = VolatileRecvWindow::new(&mut pd);
+        let connection_data = volatile_recv_window.as_connection_data();
+
         // dbg!(our_private_data);
-        connected_id.accept::<()>(None);
+        connected_id.accept(Some(&connection_data));
         let event = qd.cm.get_cm_event().expect("TODO");
         assert_eq!(RdmaCmEvent::Established, event.get_event());
         event.ack();
 
-        let control_flow = ControlFlow::new(our_conn_data, client_private_data);
+        let control_flow = ControlFlow::new(volatile_recv_window, client_private_data);
         let scheduler_handle = self.executor.add_new_connection(control_flow, qp, pd, cq);
 
         QueueDescriptor {
@@ -170,7 +174,7 @@ impl IoQueue {
 
     /// Fetch a buffer from our pre-allocated memory pool.
     /// TODO: This function should only be called once the protection domain has been allocated.
-    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemory<[u8]> {
+    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemory<u8, SIZE> {
         trace!("{}", function_name!());
 
         // TODO Do proper error handling. This expect means the connection was never properly
@@ -179,7 +183,7 @@ impl IoQueue {
             .malloc(qd.scheduler_handle.expect("Missing executor handle."))
     }
 
-    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemory<[u8]>) {
+    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemory<u8, SIZE>) {
         trace!("{}", function_name!());
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
@@ -193,7 +197,11 @@ impl IoQueue {
     /// RDMA on behalf of the user.
     /// TODO: If user drops QueueToken we will be pointing to dangling memory... We should reference
     /// count he memory ourselves...
-    pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RegisteredMemory<[u8]>) -> QueueToken {
+    pub fn push(
+        &mut self,
+        qd: &mut QueueDescriptor,
+        mem: RegisteredMemory<u8, SIZE>,
+    ) -> QueueToken {
         trace!("{}", function_name!());
 
         self.executor.push(qd.scheduler_handle.unwrap(), mem)
@@ -206,7 +214,7 @@ impl IoQueue {
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemory<[u8]> {
+    pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemory<u8, SIZE> {
         trace!("{}", function_name!());
         loop {
             self.executor.service_completion_queue(qt);
@@ -217,5 +225,12 @@ impl IoQueue {
                 Some(memory) => return memory,
             }
         }
+    }
+
+    pub fn disconnect(&mut self, mut qd: QueueDescriptor) {
+        qd.cm.disconnect().unwrap();
+        let event = qd.cm.get_cm_event().unwrap();
+        assert_eq!(event.get_event(), RdmaCmEvent::Disconnected);
+        event.ack();
     }
 }
