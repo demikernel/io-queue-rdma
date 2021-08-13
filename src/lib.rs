@@ -19,7 +19,7 @@ use tracing::{debug, info, trace, Level};
 
 /// Number of receive buffers to allocate per connection. This constant is also used when allocating
 /// new buffers.
-const RECV_BUFFERS: u64 = 100;
+const RECV_BUFFERS: u64 = 256;
 const SIZE: usize = 1000;
 
 pub struct QueueDescriptor {
@@ -76,7 +76,7 @@ impl IoQueue {
 
         // Allocate pd, cq, and qp.
         let mut pd = qd.cm.allocate_protection_domain().expect("TODO");
-        let mut cq = qd.cm.create_cq(100).expect("TODO");
+        let mut cq = qd.cm.create_cq().expect("TODO");
         let mut qp = qd.cm.create_qp(&pd, &cq);
 
         let mut our_recv_window = VolatileRecvWindow::new(&mut pd);
@@ -150,7 +150,7 @@ impl IoQueue {
         event.ack();
 
         let mut pd = connected_id.allocate_protection_domain().expect("TODO");
-        let cq = connected_id.create_cq(100).expect("TODO");
+        let cq = connected_id.create_cq().expect("TODO");
         let qp = connected_id.create_qp(&pd, &cq);
 
         // Now send our connection data to client.

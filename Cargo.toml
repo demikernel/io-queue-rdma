@@ -9,6 +9,8 @@ edition = "2018"
 rdma-cm = {path = "../rdma-cm"}
 tracing = "0.1.26"
 nix = "0.21"
+arrayvec = "0.7.1"
+futures = "0.3.16"
 
 [dev-dependencies]
 structopt = { version = "0.3", default-features = false }

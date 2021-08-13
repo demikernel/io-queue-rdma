@@ -39,6 +39,8 @@ struct Opt {
     #[structopt(short, long)]
     /// How many iterations to run the experiment for.
     loops: usize,
+    #[structopt(short, long)]
+    memory_size: usize,
 }
 
 fn main() {
@@ -93,8 +95,8 @@ fn main() {
 
             for loop_val in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);
-                let slice = memory.as_mut_slice(1000);
-                for i in 0..1000 {
+                let slice = memory.as_mut_slice(opt.memory_size);
+                for i in 0..opt.memory_size {
                     slice[i] = (loop_val % 255) as u8;
                 }
 
@@ -119,8 +121,8 @@ fn main() {
                 pop_wait += pop_wait_time.elapsed().as_micros();
                 running += roundtrip_time.elapsed().as_micros();
 
-                let slice = memory.as_mut_slice(1000);
-                for i in 0..1000 {
+                let slice = memory.as_mut_slice(opt.memory_size);
+                for i in 0..opt.memory_size {
                     assert_eq!(slice[i], (loop_val % 255) as u8);
                 }
 
