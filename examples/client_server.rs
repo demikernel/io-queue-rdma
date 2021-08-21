@@ -1,5 +1,5 @@
 use io_queue_rdma::IoQueue;
-use nix::sys::socket::{InetAddr, IpAddr, SockAddr};
+use nix::sys::socket::{InetAddr, SockAddr};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use structopt::StructOpt;
@@ -34,7 +34,7 @@ struct Opt {
     #[structopt(short, long)]
     ip_address: String,
     #[structopt(short, long)]
-    port: u16,
+    port: String,
 }
 
 fn main() {
@@ -72,7 +72,7 @@ fn main() {
         Mode::Client => {
             let mut io_queue = IoQueue::new();
             let mut connection = io_queue.socket();
-            io_queue.connect(&mut connection, InetAddr::from_std(&address));
+            io_queue.connect(&mut connection, &opt.ip_address, &opt.port);
 
             println!("Sending byte to server.");
             let mut mem = io_queue.malloc(&mut connection);

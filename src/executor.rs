@@ -1,5 +1,6 @@
 use async_channel;
 use futures::stream::StreamExt;
+use rdma_cm::PostSendOpcode;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -61,14 +62,6 @@ struct ConnectionTask<const SIZE: usize> {
     protection_domain: ProtectionDomain,
 }
 
-fn vec_to_boxed_array<T: Copy, const N: usize>(val: T) -> Box<[T; N]> {
-    let boxed_slice: Box<[T]> = vec![val; N].into_boxed_slice();
-
-    let ptr = Box::into_raw(boxed_slice) as *mut [T; N];
-
-    unsafe { Box::from_raw(ptr) }
-}
-
 impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     pub fn new() -> Executor<N, SIZE> {
         info!("{} with N={} and Size={}", function_name!(), N, SIZE);
@@ -81,7 +74,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         &mut self,
         control_flow: ControlFlow,
         queue_pair: QueuePair,
-        mut protection_domain: ProtectionDomain,
+        protection_domain: ProtectionDomain,
         completion_queue: CompletionQueue<25>,
     ) -> TaskHandle {
         info!("{}", function_name!());
@@ -96,10 +89,10 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
 
         let control_flow = Rc::new(RefCell::new(control_flow));
 
-        // Allocate four times as many vectors as our
+        // Allocate two times as many vectors as our
         let mut memory_pool: VecDeque<RegisteredMemory<u8, SIZE>> = VecDeque::with_capacity(2 * N);
         for _ in 0..2 * N {
-            let memory = protection_domain.register_array(vec_to_boxed_array::<u8, SIZE>(0));
+            let memory = protection_domain.allocate_memory::<u8, SIZE>();
             memory_pool.push_back(memory);
         }
 
@@ -276,7 +269,7 @@ struct SendWindows {
 impl Stream for SendWindows {
     type Item = u64;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.control_flow.borrow_mut().remaining_send_windows() {
             // Our local variable shows we have exhausted the send windows. Check if other side
             // has allocated more
@@ -324,12 +317,12 @@ async fn push_coroutine<const SIZE: usize>(
         let range = min(work_requests.len(), available_windows as usize);
         s.in_scope(|| debug!("Sending {} requests.", range));
 
-        let mut requests_to_send: VecDeque<(u64, RegisteredMemory<u8, SIZE>)> = work_requests
+        let requests_to_send: VecDeque<(u64, RegisteredMemory<u8, SIZE>)> = work_requests
             .drain(..range)
             .map(|wr| (wr.work_id, wr.memory))
             .collect();
 
-        queue_pairs.post_send(requests_to_send.iter());
+        queue_pairs.post_send(requests_to_send.iter(), PostSendOpcode::Send);
 
         let mut processed_push_requests = processed_requests.borrow_mut();
         for (work_id, memory) in requests_to_send {
@@ -354,7 +347,7 @@ impl Stream for RemainingReceiveWindows {
         let cf = self.control_flow.deref().borrow();
         match cf.remaining_receive_windows() {
             0 => Poll::Ready(Some(cf.batch_size)),
-            n => Poll::Pending,
+            _ => Poll::Pending,
         }
     }
 }
@@ -469,7 +462,7 @@ struct AsyncCompletionQueue<const CQ_MAX_ELEMENTS: usize> {
 impl<const CQ_MAX_ELEMENTS: usize> Stream for AsyncCompletionQueue<CQ_MAX_ELEMENTS> {
     type Item = arrayvec::IntoIter<rdma_cm::ffi::ibv_wc, CQ_MAX_ELEMENTS>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match self.cq.poll() {
             None => Poll::Pending,
             Some(entries) => Poll::Ready(Some(entries)),

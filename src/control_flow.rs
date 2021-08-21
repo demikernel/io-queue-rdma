@@ -1,46 +1,6 @@
-use rdma_cm::{CommunicationManager, ProtectionDomain, RegisteredMemory};
+use rdma_cm::{PeerConnectionData, VolatileRdmaMemory};
 
 use crate::RECV_BUFFERS;
-
-/// Connection data transmitted through the private data struct fields by our `connect` and `accept`
-/// function to set up one-sided RDMA. (u64, u32) are (address of volatile_send_window, rkey).
-#[derive(Clone, Copy, Debug)]
-pub struct PeerConnectionData {
-    remote_address: *mut u64,
-    rkey: u32,
-}
-
-/// Used to inform other side about when we allocate new recv buffers.
-pub struct VolatileRecvWindow {
-    memory: RegisteredMemory<u64, 1>,
-}
-
-impl VolatileRecvWindow {
-    /// Several steps are necessary to connect both sides for one-sided RDMA control flow.
-    /// This is the first step. Registers memory the other side will write to.
-    pub fn new(pd: &mut ProtectionDomain) -> VolatileRecvWindow {
-        let mut volatile_send_window: Box<[u64; 1]> = Box::new([0]);
-
-        let memory = pd.register_array(volatile_send_window);
-        VolatileRecvWindow { memory }
-    }
-
-    pub fn as_connection_data(&mut self) -> PeerConnectionData {
-        PeerConnectionData {
-            remote_address: self.memory.memory.as_mut_ptr(),
-            rkey: self.memory.get_rkey(),
-        }
-    }
-
-    pub fn read(&mut self) -> u64 {
-        unsafe { std::ptr::read_volatile(self.memory.memory.as_mut_ptr()) }
-    }
-
-    pub fn write(&mut self, new_value: u64) {
-        let ptr = self.memory.memory.as_mut_ptr();
-        unsafe { std::ptr::write_volatile(ptr, new_value) };
-    }
-}
 
 pub struct ControlFlow {
     /// Amount of allocated buffers left for receive requests.
@@ -48,16 +8,16 @@ pub struct ControlFlow {
     /// Amount of allocated buffers left on the other side.
     remaining_send_window: u64,
     /// Used to inform other side about when we allocate new recv buffers.
-    volatile_receive_window: VolatileRecvWindow,
+    volatile_receive_window: VolatileRdmaMemory<u64, 1>,
     /// Information required to communicate with other side.
-    other_side: PeerConnectionData,
+    other_side: PeerConnectionData<u64, 1>,
     pub(crate) batch_size: u64,
 }
 
 impl ControlFlow {
     pub fn new(
-        volatile_receive_window: VolatileRecvWindow,
-        their_conn_data: PeerConnectionData,
+        volatile_receive_window: VolatileRdmaMemory<u64, 1>,
+        their_conn_data: PeerConnectionData<u64, 1>,
     ) -> ControlFlow {
         ControlFlow {
             remaining_receive_window: 0,

@@ -1,4 +1,4 @@
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use std::task::{RawWaker, RawWakerVTable, Waker};
 
 fn do_nothing(_ptr: *const ()) {}
 

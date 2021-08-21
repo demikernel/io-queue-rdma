@@ -35,7 +35,7 @@ struct Opt {
     #[structopt(short, long)]
     ip_address: String,
     #[structopt(short, long)]
-    port: u16,
+    port: String,
     #[structopt(short, long)]
     /// How many iterations to run the experiment for.
     loops: usize,
@@ -84,7 +84,7 @@ fn main() {
         Mode::Client => {
             let mut io_queue = IoQueue::new();
             let mut connection = io_queue.socket();
-            io_queue.connect(&mut connection, InetAddr::from_std(&address));
+            io_queue.connect(&mut connection, &opt.ip_address, &opt.port);
 
             let mut running: u128 = 0;
             let mut push: u128 = 0;

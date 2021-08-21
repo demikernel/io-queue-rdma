@@ -38,6 +38,10 @@ macro_rules! function_name {
     }};
 }
 
+/// Returns only the basename of function and not its full path:
+/// io_tracker::execution::do_run_process
+/// we get:
+/// do_run_process
 #[macro_export]
 macro_rules! fn_basename {
     () => {{
