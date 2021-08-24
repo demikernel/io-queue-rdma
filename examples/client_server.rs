@@ -75,9 +75,9 @@ fn main() {
             io_queue.connect(&mut connection, &opt.ip_address, &opt.port);
 
             println!("Sending byte to server.");
-            let mut mem = io_queue.malloc(&mut connection);
-            mem.as_mut_slice(1)[0] = 42;
-            let qt = io_queue.push(&mut connection, mem);
+            let mut memory = io_queue.malloc(&mut connection);
+            memory.as_mut_slice(1)[0] = 42;
+            let qt = io_queue.push(&mut connection, memory);
             // Acquire our allocated memory again.
             let memory = io_queue.wait(qt);
             io_queue.free(&mut connection, memory);

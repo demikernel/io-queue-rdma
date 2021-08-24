@@ -3,7 +3,7 @@ use std::ptr::null_mut;
 use nix::sys::socket::SockAddr;
 use rdma_cm;
 use rdma_cm::{
-    CommunicationManager, PeerConnectionData, RdmaCmEvent, RegisteredMemory, VolatileRdmaMemory,
+    CommunicationManager, PeerConnectionData, RdmaCmEvent, RdmaMemory, VolatileRdmaMemory,
 };
 
 use crate::executor::{Executor, QueueToken, TaskHandle};
@@ -173,7 +173,7 @@ impl IoQueue {
 
     /// Fetch a buffer from our pre-allocated memory pool.
     /// TODO: This function should only be called once the protection domain has been allocated.
-    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RegisteredMemory<u8, SIZE> {
+    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RdmaMemory<u8, SIZE> {
         trace!("{}", function_name!());
 
         // TODO Do proper error handling. This expect means the connection was never properly
@@ -182,7 +182,7 @@ impl IoQueue {
             .malloc(qd.scheduler_handle.expect("Missing executor handle."))
     }
 
-    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RegisteredMemory<u8, SIZE>) {
+    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RdmaMemory<u8, SIZE>) {
         trace!("{}", function_name!());
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
@@ -196,11 +196,7 @@ impl IoQueue {
     /// RDMA on behalf of the user.
     /// TODO: If user drops QueueToken we will be pointing to dangling memory... We should reference
     /// count he memory ourselves...
-    pub fn push(
-        &mut self,
-        qd: &mut QueueDescriptor,
-        mem: RegisteredMemory<u8, SIZE>,
-    ) -> QueueToken {
+    pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RdmaMemory<u8, SIZE>) -> QueueToken {
         trace!("{}", function_name!());
 
         self.executor.push(qd.scheduler_handle.unwrap(), mem)
@@ -213,7 +209,7 @@ impl IoQueue {
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> RegisteredMemory<u8, SIZE> {
+    pub fn wait(&mut self, qt: QueueToken) -> RdmaMemory<u8, SIZE> {
         trace!("{}", function_name!());
         loop {
             self.executor.service_completion_queue(qt);

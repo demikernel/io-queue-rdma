@@ -30,16 +30,16 @@ impl FromStr for Mode {
     about = "Computes roundtrip latency for RDMA IoQueue Echo Server."
 )]
 struct Opt {
-    #[structopt(short, long)]
+    #[structopt(long)]
     mode: Mode,
-    #[structopt(short, long)]
+    #[structopt(long)]
     ip_address: String,
-    #[structopt(short, long)]
+    #[structopt(long)]
     port: String,
-    #[structopt(short, long)]
+    #[structopt(long)]
     /// How many iterations to run the experiment for.
     loops: usize,
-    #[structopt(short, long)]
+    #[structopt(long)]
     memory_size: usize,
 }
 
@@ -96,6 +96,7 @@ fn main() {
             for loop_val in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);
                 let slice = memory.as_mut_slice(opt.memory_size);
+
                 for i in 0..opt.memory_size {
                     slice[i] = (loop_val % 255) as u8;
                 }
