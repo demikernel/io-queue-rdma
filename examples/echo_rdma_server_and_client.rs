@@ -91,7 +91,6 @@ fn main() {
             let mut pop: u128 = 0;
             let mut push_wait: u128 = 0;
             let mut pop_wait: u128 = 0;
-            let fill_value = 42;
 
             for loop_val in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);

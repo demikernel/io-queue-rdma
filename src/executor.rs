@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 #[allow(unused_imports)]
-use tracing::{debug, info, span, trace, Level};
+use tracing::{debug, error, info, span, trace, Level};
 
 use crate::function_name;
 
@@ -44,24 +44,20 @@ enum CompletedRequest<const SIZE: usize> {
 // TODO: Currently we must make sure the protection domain is declared last as we need to deallocate
 // all other registered memory before deallocating protection domain. How to fix this?
 struct ConnectionTask<const SIZE: usize> {
-    recv_buffers_coroutine: Pin<Box<dyn Future<Output = ()>>>,
-
     memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, SIZE>>>>,
+
+    recv_buffers_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     push_coroutine: Pin<Box<dyn Future<Output = ()>>>,
-    completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
 
     push_work_sender: async_channel::Sender<WorkRequest<SIZE>>,
-
-    processed_requests: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
     completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<SIZE>>>>,
-
     next_pop_work_id: Receiver<u64>,
-
-    control_flow: Rc<RefCell<ControlFlow>>,
     work_id_counter: Rc<RefCell<u64>>,
+
+    completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     /// We keep the protection domain around to make sure it doesn't get dropped before
     /// everything else.
-    protection_domain: ProtectionDomain,
+    _protection_domain: ProtectionDomain,
 }
 
 impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
@@ -89,8 +85,6 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         let processed_requests = Rc::new(RefCell::new(HashMap::with_capacity(1000)));
         let completed_requests = Rc::new(RefCell::new(HashMap::with_capacity(1000)));
 
-        let control_flow = Rc::new(RefCell::new(control_flow));
-
         // Allocate two times the amount of chunks we specify.
         let memory_pool: VecDeque<RdmaMemory<u8, SIZE>> = protection_domain
             .register_chunk(2 * N)
@@ -99,10 +93,11 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
 
         let work_id_counter = Rc::new(RefCell::new(0));
         let memory_pool = Rc::new(RefCell::new(memory_pool));
+        let control_flow = Rc::new(RefCell::new(control_flow));
 
         let mut ct = ConnectionTask {
             memory_pool: memory_pool.clone(),
-            protection_domain,
+            _protection_domain: protection_domain,
             push_coroutine: Box::pin(push_coroutine(
                 queue_pair.clone(),
                 push_work_receiver,
@@ -124,17 +119,12 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
                 processed_requests.clone(),
             )),
             push_work_sender,
-            processed_requests,
             completed_requests,
             next_pop_work_id,
-            control_flow,
             work_id_counter,
         };
 
-        info!("Starting coroutines.");
         Self::schedule(&mut ct.recv_buffers_coroutine);
-        // Self::schedule(&mut ct.push_coroutine);
-        // Self::schedule(&mut ct.completions_coroutine);
 
         let current_task_id = self.tasks.len();
         self.tasks.push(ct);
@@ -228,6 +218,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
 
         let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
         Self::schedule(&mut task.completions_coroutine);
+        Self::schedule(&mut task.push_coroutine);
         Self::schedule(&mut task.recv_buffers_coroutine);
     }
 
@@ -267,11 +258,21 @@ impl Stream for SendWindows {
     type Item = u64;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.control_flow.borrow_mut().remaining_send_windows() {
+        let mut cf = self.control_flow.borrow_mut();
+        match cf.remaining_send_windows() {
             // Our local variable shows we have exhausted the send windows. Check if other side
-            // has allocated more
+            // has allocated more...
             0 => {
-                info!("Out of send windows. Checking if other side has allocated more...");
+                trace!("Out of send windows. Checking if other side has allocated more...");
+
+                // Yes. Other side _has_ allocated more receive windows. Update and we are ready.
+                let recv_windows = cf.other_side_recv_windows();
+                if recv_windows != 0 {
+                    info!("Other side has allocated more recv windows!");
+                    cf.remaining_send_window = recv_windows;
+                    cf.ack_peer_recv_windows();
+                    return Poll::Ready(Some(recv_windows));
+                }
                 Poll::Pending
             }
             n => Poll::Ready(Some(n)),
@@ -311,24 +312,28 @@ async fn push_coroutine<const SIZE: usize>(
             work_requests.push_back(push_work.try_recv().expect("TODO"));
         }
 
-        let range = min(work_requests.len(), available_windows as usize);
-        s.in_scope(|| debug!("Sending {} requests.", range));
+        // Send as many requests as possible based on the available windows.
+        let requests_number = min(work_requests.len(), available_windows as usize);
+        s.in_scope(|| debug!("Sending {} requests.", requests_number));
 
-        let requests_to_send: VecDeque<(u64, RdmaMemory<u8, SIZE>)> = work_requests
-            .drain(..range)
+        let requests: VecDeque<(u64, RdmaMemory<u8, SIZE>)> = work_requests
+            .drain(..requests_number)
             .map(|wr| (wr.work_id, wr.memory))
             .collect();
 
-        queue_pairs.post_send(requests_to_send.iter(), PostSendOpcode::Send);
+        queue_pairs.post_send(requests.iter(), PostSendOpcode::Send);
 
         let mut processed_push_requests = processed_requests.borrow_mut();
-        for (work_id, memory) in requests_to_send {
+        for (work_id, memory) in requests {
             assert!(
                 processed_push_requests.insert(work_id, memory).is_none(),
                 "duplicate entry"
             );
         }
-        // TODO Subtract send window!
+
+        control_flow
+            .borrow_mut()
+            .subtract_remaining_send_windows(requests_number as u64);
     }
 }
 
@@ -399,8 +404,8 @@ async fn post_receive_coroutine<const SIZE: usize>(
             processed_requests.insert(work_id, memory);
         }
 
-        control_flow.borrow_mut().add_recv_windows(how_many);
         *work_id_counter.borrow_mut() += how_many;
+        control_flow.borrow_mut().add_recv_windows(how_many);
     }
 }
 
@@ -413,7 +418,11 @@ async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
     let s = span!(Level::INFO, "completions_coroutine");
     s.in_scope(|| info!("started!"));
     let mut event_stream = AsyncCompletionQueue::<CQ_MAX_ELEMENTS> { cq };
-
+    // It might looks like this line doesn't do anything but it does. We need `control_flow`
+    // to get dropped before completion queue. As the queue pair inside control flow must
+    // be deallocated before the completion queue. This ensures control_flow is dropped
+    // before cq... Sorry.
+    let control_flow = control_flow;
     loop {
         let completed = event_stream
             .next()
@@ -428,21 +437,33 @@ async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
 
         for c in completed {
             s.in_scope(|| trace!("Work completion status for {}: {}", c.wr_id, c.status));
-            let memory = processed_requests.remove(&c.wr_id).
-                // This should be impossible.
-                expect("Processed entry for completed wr missing.");
+            if c.status != rdma_cm::ffi::ibv_wc_status_IBV_WC_SUCCESS {
+                panic!("Completion queue event with error status {}.", c.status);
+            }
 
-            // TODO: this if/else assumes if its not a RECV it is a SEND. But there are
-            // others.
             if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RECV {
+                let memory = processed_requests.remove(&c.wr_id).
+                    // This should be impossible.
+                    expect("Processed entry for completed wr missing.");
+
                 recv_requests_completed += 1;
                 // TODO assert request wasn't here before.
                 let bytes_transferred = c.byte_len as usize;
                 completed_requests
                     .insert(c.wr_id, CompletedRequest::Pop(memory, bytes_transferred));
-            } else {
+            } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_SEND {
+                let memory = processed_requests.remove(&c.wr_id).
+                    // This should be impossible.
+                    expect("Processed entry for completed wr missing.");
+
                 // TODO assert request wasn't here before.
                 completed_requests.insert(c.wr_id, CompletedRequest::Push(memory));
+            } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RDMA_WRITE {
+                info!("RDMA Write succeeded.");
+            } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RDMA_READ {
+                info!("RDMA Read succeeded.");
+            } else {
+                panic!("Unknown ibv_wc opcode: {:?}", c.opcode);
             }
         }
 

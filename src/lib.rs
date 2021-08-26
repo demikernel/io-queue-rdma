@@ -91,7 +91,12 @@ impl IoQueue {
             event.get_private_data().expect("Private data missing!");
         dbg!(peer);
 
-        let cf = ControlFlow::new(our_recv_window, peer);
+        let cf = ControlFlow::new(
+            qp.clone(),
+            pd.allocate_memory::<u64, 1>(),
+            our_recv_window,
+            peer,
+        );
         qd.scheduler_handle = Some(self.executor.add_new_connection(cf, qp, pd, cq));
     }
 
@@ -162,7 +167,12 @@ impl IoQueue {
         assert_eq!(RdmaCmEvent::Established, event.get_event());
         event.ack();
 
-        let control_flow = ControlFlow::new(recv_window, client_private_data);
+        let control_flow = ControlFlow::new(
+            qp.clone(),
+            pd.allocate_memory(),
+            recv_window,
+            client_private_data,
+        );
         let scheduler_handle = self.executor.add_new_connection(control_flow, qp, pd, cq);
 
         QueueDescriptor {
