@@ -19,7 +19,6 @@ use rdma_cm::{CompletionQueue, ProtectionDomain, QueuePair, RdmaMemory};
 use crate::control_flow::ControlFlow;
 use futures::Stream;
 use std::cmp::min;
-use std::collections::hash_map::Entry;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 pub(crate) struct Executor<const N: usize, const SIZE: usize> {
@@ -35,10 +34,25 @@ pub struct QueueToken {
 #[derive(Debug, Copy, Clone)]
 pub struct TaskHandle(usize);
 
-enum CompletedRequest<const SIZE: usize> {
-    /// Number of bytes received. Used to initialize registered memory.
-    Pop(RdmaMemory<u8, SIZE>, usize),
-    Push(RdmaMemory<u8, SIZE>),
+pub enum CompletedRequest<T, const SIZE: usize> {
+    Pop(RdmaMemory<T, SIZE>),
+    Push(RdmaMemory<T, SIZE>),
+}
+
+impl<T, const SIZE: usize> CompletedRequest<T, SIZE> {
+    pub fn pop_op(self) -> RdmaMemory<T, SIZE> {
+        match self {
+            CompletedRequest::Pop(memory) => memory,
+            CompletedRequest::Push(_) => panic!("Push event instead of pop."),
+        }
+    }
+
+    pub fn push_op(self) -> RdmaMemory<T, SIZE> {
+        match self {
+            CompletedRequest::Pop(_memory) => panic!("Push event instead of push."),
+            CompletedRequest::Push(memory) => memory,
+        }
+    }
 }
 
 // TODO: Currently we must make sure the protection domain is declared last as we need to deallocate
@@ -50,7 +64,7 @@ struct ConnectionTask<const SIZE: usize> {
     push_coroutine: Pin<Box<dyn Future<Output = ()>>>,
 
     push_work_sender: async_channel::Sender<WorkRequest<SIZE>>,
-    completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<SIZE>>>>,
+    completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<u8, SIZE>>>>,
     next_pop_work_id: Receiver<u64>,
     work_id_counter: Rc<RefCell<u64>>,
 
@@ -213,34 +227,30 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         }
     }
 
-    pub fn service_completion_queue(&mut self, qt: QueueToken) {
+    pub fn run_completion_coroutine(&mut self, qt: QueueToken) {
         trace!("{}", function_name!());
 
         let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
         Self::schedule(&mut task.completions_coroutine);
-        Self::schedule(&mut task.push_coroutine);
-        Self::schedule(&mut task.recv_buffers_coroutine);
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> Option<RdmaMemory<u8, SIZE>> {
+    pub fn poll_all_tasks(&mut self) {
+        trace!("{}", function_name!());
+
+        for t in self.tasks.iter_mut() {
+            Self::schedule(&mut t.completions_coroutine);
+            Self::schedule(&mut t.push_coroutine);
+            Self::schedule(&mut t.recv_buffers_coroutine);
+        }
+    }
+
+    /// Checks if work corresponding to `qt` is finished returning the data. Otherwise returns
+    /// None.
+    pub fn wait(&mut self, qt: QueueToken) -> Option<CompletedRequest<u8, SIZE>> {
         trace!("{}", function_name!());
 
         let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
-
-        match task.completed_requests.borrow_mut().entry(qt.work_id) {
-            Entry::Occupied(entry) => {
-                match entry.remove() {
-                    CompletedRequest::Pop(mut memory, bytes_transferred) => {
-                        // Access `bytes_transferred` number of bytes to
-                        memory.initialize_length(bytes_transferred);
-                        Some(memory)
-                    }
-                    CompletedRequest::Push(memory) => Some(memory),
-                }
-            }
-            // Work request not yet ready.
-            Entry::Vacant(_) => None,
-        }
+        task.completed_requests.borrow_mut().remove(&qt.work_id)
     }
 }
 
@@ -412,7 +422,7 @@ async fn post_receive_coroutine<const SIZE: usize>(
 async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
     control_flow: Rc<RefCell<ControlFlow>>,
     cq: CompletionQueue<CQ_MAX_ELEMENTS>,
-    completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<SIZE>>>>,
+    completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<u8, SIZE>>>>,
     processed_requests: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
 ) -> () {
     let s = span!(Level::INFO, "completions_coroutine");
@@ -442,15 +452,16 @@ async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
             }
 
             if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RECV {
-                let memory = processed_requests.remove(&c.wr_id).
+                let mut memory = processed_requests.remove(&c.wr_id).
                     // This should be impossible.
                     expect("Processed entry for completed wr missing.");
 
                 recv_requests_completed += 1;
-                // TODO assert request wasn't here before.
                 let bytes_transferred = c.byte_len as usize;
+                memory.initialize_length(bytes_transferred);
+                // TODO assert request wasn't here before.
                 completed_requests
-                    .insert(c.wr_id, CompletedRequest::Pop(memory, bytes_transferred));
+                    .insert(c.wr_id, CompletedRequest::Pop(memory));
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_SEND {
                 let memory = processed_requests.remove(&c.wr_id).
                     // This should be impossible.

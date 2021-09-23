@@ -94,6 +94,6 @@ impl ControlFlow {
 
         // Give us back our memory.
         let (_, memory) = IntoIter::new(wr).next().unwrap();
-        self.memory.insert(memory);
+        self.memory = Some(memory);
     }
 }

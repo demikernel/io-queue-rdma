@@ -66,7 +66,8 @@ fn main() {
 
             println!("Waiting to receive byte...");
             let qt = io_queue.pop(&mut connected_qd);
-            let mut buffer = io_queue.wait(qt);
+            let mut buffer = io_queue.wait(qt).pop_op();
+
             println!("Server got: {:?}", buffer.as_mut_slice(1)[0]);
         }
         Mode::Client => {
@@ -79,7 +80,7 @@ fn main() {
             memory.as_mut_slice(1)[0] = 42;
             let qt = io_queue.push(&mut connection, memory);
             // Acquire our allocated memory again.
-            let memory = io_queue.wait(qt);
+            let memory = io_queue.wait(qt).push_op();
             io_queue.free(&mut connection, memory);
             println!("Byte sent!");
         }

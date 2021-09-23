@@ -71,10 +71,10 @@ fn main() {
 
             for _ in 0..opt.loops {
                 let qt = io_queue.pop(&mut connected_qd);
-                let memory = io_queue.wait(qt);
+                let memory = io_queue.wait(qt).pop_op();
 
                 let qt = io_queue.push(&mut connected_qd, memory);
-                let memory = io_queue.wait(qt);
+                let memory = io_queue.wait(qt).push_op();
 
                 io_queue.free(&mut connected_qd, memory);
             }
@@ -107,26 +107,27 @@ fn main() {
                 push += push_time.elapsed().as_micros();
 
                 let push_wait_time = Instant::now();
-                let memory = io_queue.wait(qt);
+                let memory1 = io_queue.wait(qt).push_op();
                 push_wait += push_wait_time.elapsed().as_micros();
-                io_queue.free(&mut connection, memory);
 
                 let pop_time = Instant::now();
                 let qt = io_queue.pop(&mut connection);
                 pop += pop_time.elapsed().as_micros();
 
                 let pop_wait_time = Instant::now();
-                let mut memory = io_queue.wait(qt);
+                let mut memory2 = io_queue.wait(qt).pop_op();
 
                 pop_wait += pop_wait_time.elapsed().as_micros();
                 running += roundtrip_time.elapsed().as_micros();
 
-                let slice = memory.as_mut_slice(opt.memory_size);
+                let slice = memory2.as_mut_slice(opt.memory_size);
                 for i in 0..opt.memory_size {
                     assert_eq!(slice[i], (loop_val % 255) as u8);
                 }
 
-                io_queue.free(&mut connection, memory);
+                io_queue.free(&mut connection, memory1);
+                io_queue.free(&mut connection, memory2);
+
             }
             println!("Latencies averaged over {} runs.", opt.loops);
             println!(

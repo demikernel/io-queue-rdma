@@ -6,8 +6,9 @@ use rdma_cm::{
     CommunicationManager, PeerConnectionData, RdmaCmEvent, RdmaMemory, VolatileRdmaMemory,
 };
 
-use crate::executor::{Executor, QueueToken, TaskHandle};
+use crate::executor::{Executor, TaskHandle};
 use control_flow::ControlFlow;
+pub use executor::{CompletedRequest, QueueToken};
 
 mod control_flow;
 mod executor;
@@ -209,7 +210,11 @@ impl IoQueue {
     pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RdmaMemory<u8, SIZE>) -> QueueToken {
         trace!("{}", function_name!());
 
-        self.executor.push(qd.scheduler_handle.unwrap(), mem)
+        let error = "Passed queue descriptor has no scheduler associated wit it!\
+                     You likely passed the connection listener descriptor instead\
+                     of the connection descriptor.";
+        let handle = qd.scheduler_handle.expect(error);
+        self.executor.push(handle, mem)
     }
 
     /// TODO: Bad things will happen if queue token is dropped as the memory registered with
@@ -219,17 +224,29 @@ impl IoQueue {
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> RdmaMemory<u8, SIZE> {
+    pub fn wait(&mut self, qt: QueueToken) -> CompletedRequest<u8, SIZE> {
         trace!("{}", function_name!());
         loop {
-            self.executor.service_completion_queue(qt);
             match self.executor.wait(qt) {
                 None => {
-                    // TODO Have scheduler schedule relevant tasks.
+                    self.executor.run_completion_coroutine(qt);
                 }
-                Some(memory) => return memory,
+                Some(cr) => return cr,
             }
         }
+    }
+
+    pub fn wait_any(&mut self, qts: &[QueueToken]) -> (usize, CompletedRequest<u8, SIZE>) {
+        trace!("{}", function_name!());
+        loop {
+            self.executor.poll_all_tasks();
+            for (i, qt) in qts.iter().enumerate() {
+                if let Some(completed_op) = self.executor.wait(*qt) {
+                    return (i, completed_op)
+                }
+            }
+        }
+
     }
 
     pub fn disconnect(&mut self, qd: QueueDescriptor) {
