@@ -20,6 +20,7 @@ use crate::control_flow::ControlFlow;
 use futures::Stream;
 use std::cmp::min;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 pub(crate) struct Executor<const N: usize, const SIZE: usize> {
     tasks: Vec<ConnectionTask<SIZE>>,
@@ -202,7 +203,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         let work_id = match task.next_pop_work_id.try_recv() {
             Ok(work_id) => work_id,
             Err(TryRecvError::Empty) => {
-                debug!("Allocating more receive buffers.");
+                info!("Allocating more receive buffers.");
                 // Allocate more recv buffers.
                 Self::schedule(&mut task.recv_buffers_coroutine);
                 task.next_pop_work_id
@@ -240,7 +241,9 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         for t in self.tasks.iter_mut() {
             Self::schedule(&mut t.completions_coroutine);
             Self::schedule(&mut t.push_coroutine);
-            Self::schedule(&mut t.recv_buffers_coroutine);
+            // TODO For some reason doing this here causes `pop` to panic!
+            // for the echo SOSP benchmark once in a while :(
+            // Self::schedule(&mut t.recv_buffers_coroutine);
         }
     }
 
@@ -367,9 +370,17 @@ impl Stream for RemainingReceiveWindows {
 async fn post_receive_coroutine<const SIZE: usize>(
     mut queue_pair: QueuePair,
     control_flow: Rc<RefCell<ControlFlow>>,
+    // Reference to our Executor's memory poll. We take entries for here for our post_receive RDMA
+    // operation.
     memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, SIZE>>>>,
     processed_requests: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
+    // Actual counter used to keep track of what work_id we are on. This value is shared with
+    // with the push operation that increments it by 1. We increment it by `how_many` based on
+    // the new number of recv windows to allocate. But pop needs to know what numbers we reserved
+    // for recv buffer pops. Thus, the need for both work_id_counter and ready_pop_work_id.
     work_id_counter: Rc<RefCell<u64>>,
+    // Our `pop` operation knows what work ID to assign to the next based on the integers we
+    // send down this channel.
     ready_pop_work_id: Sender<u64>,
 ) {
     let s = span!(Level::INFO, "post_receive_coroutine");
@@ -379,14 +390,16 @@ async fn post_receive_coroutine<const SIZE: usize>(
     };
 
     loop {
+        s.in_scope(|| info!("Awaiting..."));
         let how_many = recv_windows
             .next()
             .await
             .expect("Our streams should never end.");
 
-        s.in_scope(|| info!("Allocating {} new receive buffers!", how_many));
+        s.in_scope(|| info!("...Allocating {} new receive buffers!", how_many));
 
         let work_id: u64 = work_id_counter.deref().borrow().clone();
+        // TODO Get rid of this allocation on the critical path. (Use ArrayVec).
         let mut receive_buffers: Vec<(u64, RdmaMemory<u8, SIZE>)> =
             Vec::with_capacity(how_many as usize);
 
@@ -409,6 +422,7 @@ async fn post_receive_coroutine<const SIZE: usize>(
         });
 
         let mut processed_requests = processed_requests.borrow_mut();
+        // info!("Receive buffers added: {}", receive_buffers.len());
         for (work_id, memory) in receive_buffers {
             ready_pop_work_id.send(work_id).unwrap();
             processed_requests.insert(work_id, memory);
@@ -470,9 +484,9 @@ async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
                 // TODO assert request wasn't here before.
                 completed_requests.insert(c.wr_id, CompletedRequest::Push(memory));
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RDMA_WRITE {
-                info!("RDMA Write succeeded.");
+                debug!("RDMA Write succeeded.");
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RDMA_READ {
-                info!("RDMA Read succeeded.");
+                debug!("RDMA Read succeeded.");
             } else {
                 panic!("Unknown ibv_wc opcode: {:?}", c.opcode);
             }

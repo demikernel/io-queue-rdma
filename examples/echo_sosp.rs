@@ -9,6 +9,7 @@ use io_queue_rdma::{IoQueue, QueueDescriptor, CompletedRequest, QueueToken};
 use utilities::Statistics;
 use nix::sys::socket::{SockAddr, InetAddr};
 use std::convert::TryInto;
+use tracing_subscriber::EnvFilter;
 
 
 #[derive(StructOpt)]
@@ -34,29 +35,36 @@ enum Options {
 
 fn main() {
     let options = Options::from_args();
+    const BUFFER_SIZE: usize = 2048;
+
+    tracing_subscriber::fmt::Subscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .without_time()
+        .init();
 
     match options {
         Options::Server { ip_address, port } => {
             let address = format!("{}:{}", ip_address, port);
             let address: SocketAddr = address.parse().expect("Unable to parse socket address");
 
-            let mut server = Server::new(address);
+            let mut server = Server::<BUFFER_SIZE>::new(address);
             server.run();
         }
         Options::Client {ip_address, port, bufsize, nflows} => {
-            let mut c = Client::new(bufsize, &ip_address, &port, nflows);
+            let mut c = Client::<BUFFER_SIZE>::new(bufsize, &ip_address, &port, nflows);
             c.client()
         }
     }
 }
 
-struct Server {
+struct Server<const N: usize> {
     stats: Statistics,
     listening_qd: QueueDescriptor,
-    libos: IoQueue,
+    libos: IoQueue<N>,
 }
 
-impl Server {
+impl<const N: usize> Server<N> {
     pub fn new(socket_address: SocketAddr) -> Self {
         let address = SockAddr::new_inet(InetAddr::from_std(&socket_address));
 
@@ -114,23 +122,22 @@ impl Server {
     }
 }
 
-struct Client {
+struct Client<const N: usize> {
     stats: Statistics,
     qd: QueueDescriptor,
     nflows: usize,
     bufsize: usize,
-    libos: IoQueue,
+    libos: IoQueue<N>,
     nextpkt: u64,
 }
 
-impl Client {
+impl<const N: usize> Client<N> {
     pub fn new(bufsize: usize, address: &str, port: &str, nflows: usize) -> Self {
         println!("buffer size {:?}, number of flows {:?}", bufsize, nflows);
 
         // Setup connection.
         let mut libos = IoQueue::new();
         let mut connection: QueueDescriptor = libos.socket();
-
 
         libos.connect(&mut connection, &address, &port);
 
@@ -145,8 +152,9 @@ impl Client {
     }
 
     fn client(&mut self) {
-        let mut qtokens: Vec<QueueToken> = Vec::new();
-        let mut packet_times: HashMap<u64, Instant> = HashMap::new();
+        // Preallocate to avoid heap allocation during measurements.
+        let mut qtokens: Vec<QueueToken> = Vec::with_capacity(1000);
+        let mut packet_times: HashMap<u64, Instant> = HashMap::with_capacity(1000);
         let mut last_log = Instant::now();
 
         // Send initial packets.
@@ -193,14 +201,14 @@ impl Client {
         }
     }
 
-    fn makepkt(&mut self, pktsize: usize) -> (RdmaMemory<u8, 1000>, u64) {
+    fn makepkt(&mut self, pktsize: usize) -> (RdmaMemory<u8, N>, u64) {
         let mut rdma_memory = self.libos.malloc(&mut self.qd);
 
         assert!(
-            pktsize <= 1000,
+            pktsize <= N,
             "pktsize {}, pktbuf size {}",
             pktsize,
-            1000,
+            N,
         );
 
         let stamp = self.nextpkt;
@@ -209,7 +217,10 @@ impl Client {
         // Factory packet.
         let stamp_slice = stamp.to_ne_bytes();
 
-        let memory_slice = rdma_memory.as_mut_slice(stamp_slice.len());
+        // Even though we are only writing to the first 8 bytes. We borrow up to `bufsize` to
+        // ensure our RDMA implemetentation sends `bufsize` bytes over the network.
+        let memory_slice = rdma_memory.as_mut_slice(self.bufsize);
+
         for i in 0..stamp_slice.len() {
             memory_slice[i] = stamp_slice[i];
         }
@@ -218,7 +229,7 @@ impl Client {
         (rdma_memory, stamp)
     }
 
-    fn getstamp(memory: &RdmaMemory<u8, 1000>) -> u64 {
+    fn getstamp(memory: &RdmaMemory<u8, N>) -> u64 {
         u64::from_ne_bytes(memory.as_slice()[0..8].try_into().unwrap())
     }
 }

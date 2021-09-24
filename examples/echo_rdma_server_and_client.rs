@@ -55,7 +55,7 @@ fn main() {
     let address: SocketAddr = address.parse().expect("Unable to parse socket address");
     match opt.mode {
         Mode::Server => {
-            let mut io_queue = IoQueue::new();
+            let mut io_queue = IoQueue::<1024>::new();
             let mut listening_qd = io_queue.socket();
 
             io_queue
@@ -82,7 +82,7 @@ fn main() {
             io_queue.disconnect(connected_qd);
         }
         Mode::Client => {
-            let mut io_queue = IoQueue::new();
+            let mut io_queue = IoQueue::<1024>::new();
             let mut connection = io_queue.socket();
             io_queue.connect(&mut connection, &opt.ip_address, &opt.port);
 
