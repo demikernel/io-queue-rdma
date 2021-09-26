@@ -43,6 +43,9 @@ struct Opt {
     memory_size: usize,
 }
 
+const WINDOW_SIZE: usize = 1024;
+const BUFFER_SIZE: usize = 1024;
+
 fn main() {
     tracing_subscriber::fmt::Subscriber::builder()
         .with_env_filter(EnvFilter::from_default_env())
@@ -55,7 +58,7 @@ fn main() {
     let address: SocketAddr = address.parse().expect("Unable to parse socket address");
     match opt.mode {
         Mode::Server => {
-            let mut io_queue = IoQueue::<1024>::new();
+            let mut io_queue = IoQueue::<WINDOW_SIZE, BUFFER_SIZE>::new();
             let mut listening_qd = io_queue.socket();
 
             io_queue
@@ -82,15 +85,17 @@ fn main() {
             io_queue.disconnect(connected_qd);
         }
         Mode::Client => {
-            let mut io_queue = IoQueue::<1024>::new();
+            let mut io_queue = IoQueue::<WINDOW_SIZE, BUFFER_SIZE>::new();
             let mut connection = io_queue.socket();
             io_queue.connect(&mut connection, &opt.ip_address, &opt.port);
 
-            let mut running: u128 = 0;
-            let mut push: u128 = 0;
-            let mut pop: u128 = 0;
-            let mut push_wait: u128 = 0;
-            let mut pop_wait: u128 = 0;
+            println!("Client connected");
+
+            let mut running: u32 = 0;
+            let mut push: u32 = 0;
+            let mut pop: u32 = 0;
+            let mut push_wait: u32 = 0;
+            let mut pop_wait: u32 = 0;
 
             for loop_val in 0..opt.loops {
                 let mut memory = io_queue.malloc(&mut connection);
@@ -104,21 +109,21 @@ fn main() {
 
                 let push_time = Instant::now();
                 let qt = io_queue.push(&mut connection, memory);
-                push += push_time.elapsed().as_micros();
+                push += push_time.elapsed().as_micros() as u32;
 
                 let push_wait_time = Instant::now();
                 let memory1 = io_queue.wait(qt).push_op();
-                push_wait += push_wait_time.elapsed().as_micros();
+                push_wait += push_wait_time.elapsed().as_micros() as u32;
 
                 let pop_time = Instant::now();
                 let qt = io_queue.pop(&mut connection);
-                pop += pop_time.elapsed().as_micros();
+                pop += pop_time.elapsed().as_micros() as u32;
 
                 let pop_wait_time = Instant::now();
                 let mut memory2 = io_queue.wait(qt).pop_op();
+                pop_wait += pop_wait_time.elapsed().as_micros() as u32;
 
-                pop_wait += pop_wait_time.elapsed().as_micros();
-                running += roundtrip_time.elapsed().as_micros();
+                running += roundtrip_time.elapsed().as_micros() as u32;
 
                 let slice = memory2.as_mut_slice(opt.memory_size);
                 for i in 0..opt.memory_size {
@@ -127,23 +132,15 @@ fn main() {
 
                 io_queue.free(&mut connection, memory1);
                 io_queue.free(&mut connection, memory2);
-
             }
-            println!("Latencies averaged over {} runs.", opt.loops);
-            println!(
-                "Total roundtrip latency: {}us",
-                (running as f64) / (opt.loops as f64)
-            );
-            println!("Push latency: {}us", (push as f64) / (opt.loops as f64));
-            println!(
-                "Push-wait latency: {}us",
-                (push_wait as f64) / (opt.loops as f64)
-            );
-            println!("Pop latency: {}us", (pop as f64) / (opt.loops as f64));
-            println!(
-                "Pop-wait latency: {}us",
-                (pop_wait as f64) / (opt.loops as f64)
-            );
+
+            let loops = opt.loops as f64;
+            println!("Latencies averaged over {} runs.", loops);
+            println!("Total roundtrip latency: {}us", (running as f64) / loops);
+            println!("Push latency: {}us", (push as f64) / loops);
+            println!("Push-wait latency: {}us", (push_wait as f64) / loops);
+            println!("Pop latency: {}us", (pop as f64) / loops);
+            println!("Pop-wait latency: {}us", (pop_wait as f64) / loops);
             io_queue.disconnect(connection);
         }
     }

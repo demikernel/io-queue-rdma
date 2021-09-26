@@ -17,22 +17,18 @@ mod waker;
 #[allow(unused_imports)]
 use tracing::{debug, info, trace, Level};
 
-/// Number of receive buffers to allocate per connection. This constant is also used when allocating
-/// new buffers.
-const RECV_BUFFERS: u64 = 256;
-
 pub struct QueueDescriptor {
     cm: rdma_cm::CommunicationManager,
     // TODO a better API could avoid having these as options
     scheduler_handle: Option<TaskHandle>,
 }
 
-pub struct IoQueue<const N: usize> {
-    executor: executor::Executor<{ RECV_BUFFERS as usize }, N>,
+pub struct IoQueue<const WINDOW_SIZE: usize, const N: usize> {
+    executor: executor::Executor<WINDOW_SIZE, N>,
 }
 
-impl<const N: usize> IoQueue<N> {
-    pub fn new() -> IoQueue<N> {
+impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
+    pub fn new() -> IoQueue<WINDOW_SIZE, N> {
         info!("{}", function_name!());
         IoQueue {
             executor: Executor::new(),
@@ -65,7 +61,7 @@ impl<const N: usize> IoQueue<N> {
     pub fn connect(&mut self, qd: &mut QueueDescriptor, node: &str, service: &str) {
         info!("{}", function_name!());
 
-        IoQueue::<N>::resolve_address(qd, node, service);
+        IoQueue::<WINDOW_SIZE, N>::resolve_address(qd, node, service);
 
         // Resolve route
         qd.cm.resolve_route(1).expect("TODO");
@@ -228,7 +224,7 @@ impl<const N: usize> IoQueue<N> {
         loop {
             match self.executor.wait(qt) {
                 None => {
-                    self.executor.run_completion_coroutine(qt);
+                    self.executor.background_tasks(qt);
                 }
                 Some(cr) => return cr,
             }
@@ -241,11 +237,10 @@ impl<const N: usize> IoQueue<N> {
             self.executor.poll_all_tasks();
             for (i, qt) in qts.iter().enumerate() {
                 if let Some(completed_op) = self.executor.wait(*qt) {
-                    return (i, completed_op)
+                    return (i, completed_op);
                 }
             }
         }
-
     }
 
     pub fn disconnect(&mut self, qd: QueueDescriptor) {

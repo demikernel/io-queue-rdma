@@ -1,8 +1,9 @@
 use async_channel;
 use futures::stream::StreamExt;
+use hashbrown::HashMap;
 use rdma_cm::PostSendOpcode;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -22,8 +23,8 @@ use std::cmp::min;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-pub(crate) struct Executor<const N: usize, const SIZE: usize> {
-    tasks: Vec<ConnectionTask<SIZE>>,
+pub(crate) struct Executor<const WINDOW_SIZE: usize, const SIZE: usize> {
+    tasks: Vec<ConnectionTask<WINDOW_SIZE, SIZE>>,
 }
 
 #[derive(Copy, Clone)]
@@ -58,16 +59,17 @@ impl<T, const SIZE: usize> CompletedRequest<T, SIZE> {
 
 // TODO: Currently we must make sure the protection domain is declared last as we need to deallocate
 // all other registered memory before deallocating protection domain. How to fix this?
-struct ConnectionTask<const SIZE: usize> {
-    memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, SIZE>>>>,
+struct ConnectionTask<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> {
+    memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, BUFFER_SIZE>>>>,
 
     recv_buffers_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     push_coroutine: Pin<Box<dyn Future<Output = ()>>>,
 
-    push_work_sender: async_channel::Sender<WorkRequest<SIZE>>,
-    completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<u8, SIZE>>>>,
+    push_work_sender: async_channel::Sender<WorkRequest<BUFFER_SIZE>>,
+    completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<u8, BUFFER_SIZE>>>>,
     next_pop_work_id: Receiver<u64>,
     work_id_counter: Rc<RefCell<u64>>,
+    control_flow: Rc<RefCell<ControlFlow<{ WINDOW_SIZE }>>>,
 
     completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     /// We keep the protection domain around to make sure it doesn't get dropped before
@@ -75,9 +77,14 @@ struct ConnectionTask<const SIZE: usize> {
     _protection_domain: ProtectionDomain,
 }
 
-impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
-    pub fn new() -> Executor<N, SIZE> {
-        info!("{} with N={} and Size={}", function_name!(), N, SIZE);
+impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, BUFFER_SIZE> {
+    pub fn new() -> Executor<WINDOW_SIZE, BUFFER_SIZE> {
+        info!(
+            "{} with N={} and Size={}",
+            function_name!(),
+            WINDOW_SIZE,
+            BUFFER_SIZE
+        );
         Executor {
             tasks: Vec::with_capacity(100),
         }
@@ -85,15 +92,15 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
 
     pub fn add_new_connection(
         &mut self,
-        control_flow: ControlFlow,
-        queue_pair: QueuePair,
+        control_flow: ControlFlow<WINDOW_SIZE>,
+        queue_pair: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
         protection_domain: ProtectionDomain,
-        completion_queue: CompletionQueue<25>,
+        completion_queue: CompletionQueue<32>,
     ) -> TaskHandle {
         info!("{}", function_name!());
 
         let (push_work_sender, push_work_receiver) =
-            async_channel::unbounded::<WorkRequest<SIZE>>();
+            async_channel::unbounded::<WorkRequest<BUFFER_SIZE>>();
 
         let (ready_pop_work_id, next_pop_work_id) = std::sync::mpsc::channel::<u64>();
 
@@ -101,8 +108,8 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         let completed_requests = Rc::new(RefCell::new(HashMap::with_capacity(1000)));
 
         // Allocate two times the amount of chunks we specify.
-        let memory_pool: VecDeque<RdmaMemory<u8, SIZE>> = protection_domain
-            .register_chunk(2 * N)
+        let memory_pool: VecDeque<RdmaMemory<u8, BUFFER_SIZE>> = protection_domain
+            .register_chunk(2 * WINDOW_SIZE)
             .into_iter()
             .collect();
 
@@ -119,7 +126,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
                 control_flow.clone(),
                 processed_requests.clone(),
             )),
-            recv_buffers_coroutine: Box::pin(post_receive_coroutine(
+            recv_buffers_coroutine: Box::pin(receive_coroutine(
                 queue_pair,
                 control_flow.clone(),
                 memory_pool,
@@ -133,6 +140,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
                 completed_requests.clone(),
                 processed_requests.clone(),
             )),
+            control_flow,
             push_work_sender,
             completed_requests,
             next_pop_work_id,
@@ -146,7 +154,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         TaskHandle(current_task_id)
     }
 
-    pub fn malloc(&mut self, task: TaskHandle) -> RdmaMemory<u8, SIZE> {
+    pub fn malloc(&mut self, task: TaskHandle) -> RdmaMemory<u8, BUFFER_SIZE> {
         trace!("{}", function_name!());
 
         let mut memory_pool = self
@@ -160,7 +168,7 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     }
 
     // TODO Make sure this buffer actually belongs to this handle?
-    pub fn free(&mut self, task: TaskHandle, mut memory: RdmaMemory<u8, SIZE>) {
+    pub fn free(&mut self, task: TaskHandle, mut memory: RdmaMemory<u8, BUFFER_SIZE>) {
         trace!("{}", function_name!());
 
         memory.reset_access();
@@ -174,10 +182,15 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         memory_pool.push_back(memory)
     }
 
-    pub fn push(&mut self, task_handle: TaskHandle, memory: RdmaMemory<u8, SIZE>) -> QueueToken {
+    pub fn push(
+        &mut self,
+        task_handle: TaskHandle,
+        memory: RdmaMemory<u8, BUFFER_SIZE>,
+    ) -> QueueToken {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(task_handle.0).unwrap();
+        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+            self.tasks.get_mut(task_handle.0).unwrap();
 
         let work_id: u64 = task.work_id_counter.borrow_mut().clone();
         *task.work_id_counter.borrow_mut() += 1;
@@ -186,7 +199,6 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         task.push_work_sender
             .try_send(work)
             .expect("Channel should never be full or dropped.");
-        // TODO: Is push coroutine called too often?
         Self::schedule(&mut task.push_coroutine);
 
         QueueToken {
@@ -198,17 +210,20 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
     pub fn pop(&mut self, task_handle: TaskHandle) -> QueueToken {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(task_handle.0).unwrap();
+        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+            self.tasks.get_mut(task_handle.0).unwrap();
 
         let work_id = match task.next_pop_work_id.try_recv() {
             Ok(work_id) => work_id,
             Err(TryRecvError::Empty) => {
                 info!("Allocating more receive buffers.");
                 // Allocate more recv buffers.
+                assert_eq!(0, task.control_flow.borrow().remaining_receive_windows());
                 Self::schedule(&mut task.recv_buffers_coroutine);
+                info!("Done calling recv_buffers coroutine.");
                 task.next_pop_work_id
                     .try_recv()
-                    .expect("Could not allocate more recv buffers")
+                    .expect("Could not allocate more recv buffers?")
             }
             Err(TryRecvError::Disconnected) => panic!("next_pop_work_id disconnected"),
         };
@@ -228,11 +243,14 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         }
     }
 
-    pub fn run_completion_coroutine(&mut self, qt: QueueToken) {
+    pub fn background_tasks(&mut self, qt: QueueToken) {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
+        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+            self.tasks.get_mut(qt.task_id.0).unwrap();
         Self::schedule(&mut task.completions_coroutine);
+        Self::schedule(&mut task.push_coroutine);
+        Self::schedule(&mut task.recv_buffers_coroutine);
     }
 
     pub fn poll_all_tasks(&mut self) {
@@ -241,18 +259,17 @@ impl<const N: usize, const SIZE: usize> Executor<N, SIZE> {
         for t in self.tasks.iter_mut() {
             Self::schedule(&mut t.completions_coroutine);
             Self::schedule(&mut t.push_coroutine);
-            // TODO For some reason doing this here causes `pop` to panic!
-            // for the echo SOSP benchmark once in a while :(
-            // Self::schedule(&mut t.recv_buffers_coroutine);
+            Self::schedule(&mut t.recv_buffers_coroutine);
         }
     }
 
     /// Checks if work corresponding to `qt` is finished returning the data. Otherwise returns
     /// None.
-    pub fn wait(&mut self, qt: QueueToken) -> Option<CompletedRequest<u8, SIZE>> {
+    pub fn wait(&mut self, qt: QueueToken) -> Option<CompletedRequest<u8, BUFFER_SIZE>> {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<SIZE> = self.tasks.get_mut(qt.task_id.0).unwrap();
+        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+            self.tasks.get_mut(qt.task_id.0).unwrap();
         task.completed_requests.borrow_mut().remove(&qt.work_id)
     }
 }
@@ -262,12 +279,12 @@ struct WorkRequest<const SIZE: usize> {
     work_id: u64,
 }
 
-struct SendWindows {
-    control_flow: Rc<RefCell<ControlFlow>>,
+struct SendWindows<const WINDOW_SIZE: usize> {
+    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
 }
 
 /// Pending until more send windows are allocated by other side.
-impl Stream for SendWindows {
+impl<const WINDOW_SIZE: usize> Stream for SendWindows<WINDOW_SIZE> {
     type Item = u64;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -294,10 +311,10 @@ impl Stream for SendWindows {
 }
 
 // Note: Make sure you don't hold RefCells across yield points.
-async fn push_coroutine<const SIZE: usize>(
-    mut queue_pairs: QueuePair,
+async fn push_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
+    mut queue_pairs: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
     push_work: async_channel::Receiver<WorkRequest<SIZE>>,
-    control_flow: Rc<RefCell<ControlFlow>>,
+    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
     processed_requests: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
 ) {
     let s = span!(Level::INFO, "push_coroutine");
@@ -306,7 +323,8 @@ async fn push_coroutine<const SIZE: usize>(
         control_flow: control_flow.clone(),
     };
 
-    let mut work_requests: VecDeque<WorkRequest<SIZE>> = VecDeque::with_capacity(1000);
+    let mut work_requests: VecDeque<WorkRequest<SIZE>> = VecDeque::with_capacity(WINDOW_SIZE);
+    let mut requests: VecDeque<(u64, RdmaMemory<u8, SIZE>)> = VecDeque::with_capacity(WINDOW_SIZE);
 
     loop {
         let available_windows = send_windows
@@ -329,15 +347,14 @@ async fn push_coroutine<const SIZE: usize>(
         let requests_number = min(work_requests.len(), available_windows as usize);
         s.in_scope(|| debug!("Sending {} requests.", requests_number));
 
-        let requests: VecDeque<(u64, RdmaMemory<u8, SIZE>)> = work_requests
-            .drain(..requests_number)
-            .map(|wr| (wr.work_id, wr.memory))
-            .collect();
+        for wr in work_requests.drain(..requests_number) {
+            requests.push_back((wr.work_id, wr.memory));
+        }
 
         queue_pairs.post_send(requests.iter(), PostSendOpcode::Send);
 
         let mut processed_push_requests = processed_requests.borrow_mut();
-        for (work_id, memory) in requests {
+        for (work_id, memory) in requests.drain(..requests_number) {
             assert!(
                 processed_push_requests.insert(work_id, memory).is_none(),
                 "duplicate entry"
@@ -350,26 +367,26 @@ async fn push_coroutine<const SIZE: usize>(
     }
 }
 
-struct RemainingReceiveWindows {
-    control_flow: Rc<RefCell<ControlFlow>>,
+struct RemainingReceiveWindows<const WINDOW_SIZE: usize> {
+    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
 }
 
 /// Pending until more send windows are allocated by other side.
-impl Stream for RemainingReceiveWindows {
+impl<const WINDOW_SIZE: usize> Stream for RemainingReceiveWindows<WINDOW_SIZE> {
     type Item = u64;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let cf = self.control_flow.deref().borrow();
         match cf.remaining_receive_windows() {
-            0 => Poll::Ready(Some(cf.batch_size)),
+            0 => Poll::Ready(Some(WINDOW_SIZE as u64)),
             _ => Poll::Pending,
         }
     }
 }
 
-async fn post_receive_coroutine<const SIZE: usize>(
-    mut queue_pair: QueuePair,
-    control_flow: Rc<RefCell<ControlFlow>>,
+async fn receive_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
+    mut queue_pair: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
+    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
     // Reference to our Executor's memory poll. We take entries for here for our post_receive RDMA
     // operation.
     memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, SIZE>>>>,
@@ -383,6 +400,8 @@ async fn post_receive_coroutine<const SIZE: usize>(
     // send down this channel.
     ready_pop_work_id: Sender<u64>,
 ) {
+    let mut receive_buffers: Vec<(u64, RdmaMemory<u8, SIZE>)> = Vec::with_capacity(WINDOW_SIZE);
+
     let s = span!(Level::INFO, "post_receive_coroutine");
     s.in_scope(|| debug!("started!"));
     let mut recv_windows = RemainingReceiveWindows {
@@ -399,9 +418,6 @@ async fn post_receive_coroutine<const SIZE: usize>(
         s.in_scope(|| info!("...Allocating {} new receive buffers!", how_many));
 
         let work_id: u64 = work_id_counter.deref().borrow().clone();
-        // TODO Get rid of this allocation on the critical path. (Use ArrayVec).
-        let mut receive_buffers: Vec<(u64, RdmaMemory<u8, SIZE>)> =
-            Vec::with_capacity(how_many as usize);
 
         for i in work_id..work_id + how_many {
             let memory = memory_pool
@@ -423,24 +439,31 @@ async fn post_receive_coroutine<const SIZE: usize>(
 
         let mut processed_requests = processed_requests.borrow_mut();
         // info!("Receive buffers added: {}", receive_buffers.len());
-        for (work_id, memory) in receive_buffers {
+        for (work_id, memory) in receive_buffers.drain(..how_many as usize) {
             ready_pop_work_id.send(work_id).unwrap();
-            processed_requests.insert(work_id, memory);
+            assert!(
+                processed_requests.insert(work_id, memory).is_none(),
+                "duplicate entry"
+            );
         }
-
         *work_id_counter.borrow_mut() += how_many;
         control_flow.borrow_mut().add_recv_windows(how_many);
     }
 }
 
-async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
-    control_flow: Rc<RefCell<ControlFlow>>,
+async fn completions_coroutine<
+    const WINDOW_SIZE: usize,
+    const CQ_MAX_ELEMENTS: usize,
+    const SIZE: usize,
+>(
+    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
     cq: CompletionQueue<CQ_MAX_ELEMENTS>,
     completed_requests: Rc<RefCell<HashMap<u64, CompletedRequest<u8, SIZE>>>>,
     processed_requests: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
 ) -> () {
     let s = span!(Level::INFO, "completions_coroutine");
     s.in_scope(|| info!("started!"));
+
     let mut event_stream = AsyncCompletionQueue::<CQ_MAX_ELEMENTS> { cq };
     // It might looks like this line doesn't do anything but it does. We need `control_flow`
     // to get dropped before completion queue. As the queue pair inside control flow must
@@ -473,16 +496,23 @@ async fn completions_coroutine<const CQ_MAX_ELEMENTS: usize, const SIZE: usize>(
                 recv_requests_completed += 1;
                 let bytes_transferred = c.byte_len as usize;
                 memory.initialize_length(bytes_transferred);
-                // TODO assert request wasn't here before.
-                completed_requests
-                    .insert(c.wr_id, CompletedRequest::Pop(memory));
+                assert!(
+                    completed_requests
+                        .insert(c.wr_id, CompletedRequest::Pop(memory))
+                        .is_none(),
+                    "duplicate entry"
+                );
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_SEND {
                 let memory = processed_requests.remove(&c.wr_id).
                     // This should be impossible.
                     expect("Processed entry for completed wr missing.");
 
-                // TODO assert request wasn't here before.
-                completed_requests.insert(c.wr_id, CompletedRequest::Push(memory));
+                assert!(
+                    completed_requests
+                        .insert(c.wr_id, CompletedRequest::Push(memory))
+                        .is_none(),
+                    "duplicate entry"
+                );
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RDMA_WRITE {
                 debug!("RDMA Write succeeded.");
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_RDMA_READ {

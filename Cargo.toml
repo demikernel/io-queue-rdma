@@ -12,6 +12,7 @@ nix = "0.21"
 arrayvec = "0.7.1"
 futures = "0.3.16"
 async-channel = "1.6.1"
+hashbrown = "0.3"
 
 [dev-dependencies]
 structopt = { version = "0.3", default-features = false }

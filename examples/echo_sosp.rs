@@ -1,16 +1,15 @@
-use structopt::StructOpt;
+use hashbrown::HashMap;
 use std::net::SocketAddr;
-use std::collections::HashMap;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
+use structopt::StructOpt;
 
 use io_queue_rdma;
+use io_queue_rdma::{CompletedRequest, IoQueue, QueueDescriptor, QueueToken};
+use nix::sys::socket::{InetAddr, SockAddr};
 use rdma_cm::RdmaMemory;
-use io_queue_rdma::{IoQueue, QueueDescriptor, CompletedRequest, QueueToken};
-use utilities::Statistics;
-use nix::sys::socket::{SockAddr, InetAddr};
 use std::convert::TryInto;
 use tracing_subscriber::EnvFilter;
-
+use utilities::Statistics;
 
 #[derive(StructOpt)]
 #[structopt(about = "SOSP Echo Benchmark")]
@@ -30,12 +29,14 @@ enum Options {
         bufsize: usize,
         #[structopt(long)]
         nflows: usize,
-    }
+    },
 }
+
+const BUFFER_SIZE: usize = 1024;
+const WINDOW_SIZE: usize = 1024;
 
 fn main() {
     let options = Options::from_args();
-    const BUFFER_SIZE: usize = 2048;
 
     tracing_subscriber::fmt::Subscriber::builder()
         .with_env_filter(EnvFilter::from_default_env())
@@ -48,23 +49,29 @@ fn main() {
             let address = format!("{}:{}", ip_address, port);
             let address: SocketAddr = address.parse().expect("Unable to parse socket address");
 
-            let mut server = Server::<BUFFER_SIZE>::new(address);
+            let mut server = Server::<WINDOW_SIZE, BUFFER_SIZE>::new(address);
             server.run();
         }
-        Options::Client {ip_address, port, bufsize, nflows} => {
-            let mut c = Client::<BUFFER_SIZE>::new(bufsize, &ip_address, &port, nflows);
+        Options::Client {
+            ip_address,
+            port,
+            bufsize,
+            nflows,
+        } => {
+            let mut c =
+                Client::<WINDOW_SIZE, BUFFER_SIZE>::new(bufsize, &ip_address, &port, nflows);
             c.client()
         }
     }
 }
 
-struct Server<const N: usize> {
+struct Server<const WINDOW_SIZE: usize, const N: usize> {
     stats: Statistics,
     listening_qd: QueueDescriptor,
-    libos: IoQueue<N>,
+    libos: IoQueue<WINDOW_SIZE, N>,
 }
 
-impl<const N: usize> Server<N> {
+impl<const WINDOW_SIZE: usize, const N: usize> Server<WINDOW_SIZE, N> {
     pub fn new(socket_address: SocketAddr) -> Self {
         let address = SockAddr::new_inet(InetAddr::from_std(&socket_address));
 
@@ -110,28 +117,27 @@ impl<const N: usize> Server<N> {
                     qtokens.push(qt);
                 }
                 CompletedRequest::Push(memory) => {
-                    self.libos.free(&mut connected_qd, memory);
-
                     self.stats.record(2 * bufsize, start.elapsed());
                     start = Instant::now();
                     let qt = self.libos.pop(&mut connected_qd);
                     qtokens.push(qt);
+                    self.libos.free(&mut connected_qd, memory);
                 }
             }
         }
     }
 }
 
-struct Client<const N: usize> {
+struct Client<const WINDOW_SIZE: usize, const N: usize> {
     stats: Statistics,
     qd: QueueDescriptor,
     nflows: usize,
     bufsize: usize,
-    libos: IoQueue<N>,
+    libos: IoQueue<WINDOW_SIZE, N>,
     nextpkt: u64,
 }
 
-impl<const N: usize> Client<N> {
+impl<const WINDOW_SIZE: usize, const N: usize> Client<WINDOW_SIZE, N> {
     pub fn new(bufsize: usize, address: &str, port: &str, nflows: usize) -> Self {
         println!("buffer size {:?}, number of flows {:?}", bufsize, nflows);
 
@@ -204,12 +210,7 @@ impl<const N: usize> Client<N> {
     fn makepkt(&mut self, pktsize: usize) -> (RdmaMemory<u8, N>, u64) {
         let mut rdma_memory = self.libos.malloc(&mut self.qd);
 
-        assert!(
-            pktsize <= N,
-            "pktsize {}, pktbuf size {}",
-            pktsize,
-            N,
-        );
+        assert!(pktsize <= N, "pktsize {}, pktbuf size {}", pktsize, N,);
 
         let stamp = self.nextpkt;
         self.nextpkt += 1;
@@ -224,7 +225,6 @@ impl<const N: usize> Client<N> {
         for i in 0..stamp_slice.len() {
             memory_slice[i] = stamp_slice[i];
         }
-
 
         (rdma_memory, stamp)
     }
