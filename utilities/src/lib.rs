@@ -27,8 +27,8 @@ impl Statistics {
     fn throughput(&self) -> f64 {
         let duration = self.latency();
         let nbytes = self.bytes.percentile(0.50).unwrap();
-        dbg!(nbytes);
-        dbg!(duration.as_secs_f64());
+        // dbg!(nbytes);
+        // dbg!(duration.as_secs_f64());
 
         let bps = (nbytes as f64) / duration.as_secs_f64();
         bps / 1024. / 1024. / 1024. * 8.

@@ -95,28 +95,45 @@ impl<const WINDOW_SIZE: usize, const N: usize> Server<WINDOW_SIZE, N> {
         let mut bufsize: usize = 0;
         let mut start: Instant = Instant::now();
         let mut last_log: Instant = Instant::now();
+        let mut byte_count: usize = 0;
+
+        // let mut wait: Vec<u32> = Vec::with_capacity(10000000);
+        // let mut push_times: Vec<u32> = Vec::with_capacity(10000000);
 
         // Wait for client to write to us.
         let qt = self.libos.pop(&mut connected_qd);
         qtokens.push(qt);
 
         loop {
+            let elapsed = last_log.elapsed();
             // Dump statistics.
-            if last_log.elapsed() > Duration::from_secs(5) {
+            if elapsed > Duration::from_secs(5) {
                 self.stats.print();
+                let throughput = ((byte_count as f64) / (elapsed.as_nanos() as f64))
+                    / (1024 * 1024 * 128) as f64
+                    * 1_000_000_000 as f64;
+                dbg!(throughput);
+                byte_count = 0;
                 last_log = Instant::now();
             }
 
+            // let wait_start = Instant::now();
             let (i, result) = self.libos.wait_any(&qtokens);
             qtokens.swap_remove(i);
+            // wait.push(wait_start.elapsed().as_nanos() as u32);
 
             match result {
                 CompletedRequest::Pop(memory) => {
                     bufsize = memory.accessed();
+                    byte_count += bufsize;
+
+                    // let push = Instant::now();
                     let qt = self.libos.push(&mut connected_qd, memory);
                     qtokens.push(qt);
+                    // push_times.push(wait_start.elapsed().as_nanos() as u32);
                 }
                 CompletedRequest::Push(memory) => {
+                    byte_count += memory.accessed();
                     self.stats.record(2 * bufsize, start.elapsed());
                     start = Instant::now();
                     let qt = self.libos.pop(&mut connected_qd);

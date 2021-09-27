@@ -224,7 +224,7 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
         loop {
             match self.executor.wait(qt) {
                 None => {
-                    self.executor.background_tasks(qt);
+                    self.executor.poll_coroutines(qt);
                 }
                 Some(cr) => return cr,
             }
@@ -234,12 +234,12 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
     pub fn wait_any(&mut self, qts: &[QueueToken]) -> (usize, CompletedRequest<u8, N>) {
         trace!("{}", function_name!());
         loop {
-            self.executor.poll_all_tasks();
             for (i, qt) in qts.iter().enumerate() {
                 if let Some(completed_op) = self.executor.wait(*qt) {
                     return (i, completed_op);
                 }
             }
+            self.executor.poll_all_tasks();
         }
     }
 
