@@ -46,6 +46,16 @@ impl Statistics {
         }
     }
 
+    fn latency01(&self) -> Duration {
+        let median = self.times.percentile(0.01).unwrap();
+        Duration::from_nanos(median)
+    }
+
+    fn latency99(&self) -> Duration {
+        let median = self.times.percentile(0.99).unwrap();
+        Duration::from_nanos(median)
+    }
+
     pub fn print(&self) {
         if self.times.entries() > 0 {
             println!(
@@ -54,6 +64,17 @@ impl Statistics {
                 self.latency(),
                 self.throughput(),
             );
+            // println!("99: {:?}", self.latency99());
+            // println!("01: {:?}", self.latency01());
+            // for bucket in self.times.into_iter() {
+            //     if bucket.count() != 0 {
+            //         println!(
+            //             "{:?} {}",
+            //             Duration::from_nanos(bucket.value()),
+            //             bucket.count()
+            //         );
+            //     }
+            // }
         }
     }
 

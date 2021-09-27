@@ -32,6 +32,9 @@ enum Options {
     },
 }
 
+const RECV_WRS: usize = 4096;
+const SEND_WRS: usize = 128;
+const CQ_ELEMENTS: usize = 64;
 const BUFFER_SIZE: usize = 1024;
 const WINDOW_SIZE: usize = 1024;
 
@@ -49,7 +52,8 @@ fn main() {
             let address = format!("{}:{}", ip_address, port);
             let address: SocketAddr = address.parse().expect("Unable to parse socket address");
 
-            let mut server = Server::<WINDOW_SIZE, BUFFER_SIZE>::new(address);
+            let mut server =
+                Server::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::new(address);
             server.run();
         }
         Options::Client {
@@ -58,20 +62,37 @@ fn main() {
             bufsize,
             nflows,
         } => {
-            let mut c =
-                Client::<WINDOW_SIZE, BUFFER_SIZE>::new(bufsize, &ip_address, &port, nflows);
+            let mut c = Client::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::new(
+                bufsize,
+                &ip_address,
+                &port,
+                nflows,
+            );
             c.client()
         }
     }
 }
 
-struct Server<const WINDOW_SIZE: usize, const N: usize> {
+struct Server<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const CQ_ELEMENTS: usize,
+    const WINDOW_SIZE: usize,
+    const BUFFER_SIZE: usize,
+> {
     stats: Statistics,
     listening_qd: QueueDescriptor,
-    libos: IoQueue<WINDOW_SIZE, N>,
+    libos: IoQueue<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>,
 }
 
-impl<const WINDOW_SIZE: usize, const N: usize> Server<WINDOW_SIZE, N> {
+impl<
+        const RECV_WRS: usize,
+        const SEND_WRS: usize,
+        const CQ_ELEMENTS: usize,
+        const WINDOW_SIZE: usize,
+        const BUFFER_SIZE: usize,
+    > Server<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>
+{
     pub fn new(socket_address: SocketAddr) -> Self {
         let address = SockAddr::new_inet(InetAddr::from_std(&socket_address));
 
@@ -95,47 +116,35 @@ impl<const WINDOW_SIZE: usize, const N: usize> Server<WINDOW_SIZE, N> {
         let mut bufsize: usize = 0;
         let mut start: Instant = Instant::now();
         let mut last_log: Instant = Instant::now();
-        let mut byte_count: usize = 0;
-
-        // let mut wait: Vec<u32> = Vec::with_capacity(10000000);
-        // let mut push_times: Vec<u32> = Vec::with_capacity(10000000);
 
         // Wait for client to write to us.
         let qt = self.libos.pop(&mut connected_qd);
         qtokens.push(qt);
 
         loop {
-            let elapsed = last_log.elapsed();
             // Dump statistics.
-            if elapsed > Duration::from_secs(5) {
+            if last_log.elapsed() > Duration::from_secs(5) {
                 self.stats.print();
-                let throughput = ((byte_count as f64) / (elapsed.as_nanos() as f64))
-                    / (1024 * 1024 * 128) as f64
-                    * 1_000_000_000 as f64;
-                dbg!(throughput);
-                byte_count = 0;
+
                 last_log = Instant::now();
             }
 
             // let wait_start = Instant::now();
             let (i, result) = self.libos.wait_any(&qtokens);
             qtokens.swap_remove(i);
-            // wait.push(wait_start.elapsed().as_nanos() as u32);
 
             match result {
                 CompletedRequest::Pop(memory) => {
                     bufsize = memory.accessed();
-                    byte_count += bufsize;
 
                     // let push = Instant::now();
                     let qt = self.libos.push(&mut connected_qd, memory);
                     qtokens.push(qt);
-                    // push_times.push(wait_start.elapsed().as_nanos() as u32);
                 }
                 CompletedRequest::Push(memory) => {
-                    byte_count += memory.accessed();
                     self.stats.record(2 * bufsize, start.elapsed());
                     start = Instant::now();
+
                     let qt = self.libos.pop(&mut connected_qd);
                     qtokens.push(qt);
                     self.libos.free(&mut connected_qd, memory);
@@ -145,16 +154,29 @@ impl<const WINDOW_SIZE: usize, const N: usize> Server<WINDOW_SIZE, N> {
     }
 }
 
-struct Client<const WINDOW_SIZE: usize, const N: usize> {
+struct Client<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const CQ_ELEMENTS: usize,
+    const WINDOW_SIZE: usize,
+    const N: usize,
+> {
     stats: Statistics,
     qd: QueueDescriptor,
     nflows: usize,
     bufsize: usize,
-    libos: IoQueue<WINDOW_SIZE, N>,
+    libos: IoQueue<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, N>,
     nextpkt: u64,
 }
 
-impl<const WINDOW_SIZE: usize, const N: usize> Client<WINDOW_SIZE, N> {
+impl<
+        const RECV_WRS: usize,
+        const SEND_WRS: usize,
+        const CQ_ELEMENTS: usize,
+        const WINDOW_SIZE: usize,
+        const N: usize,
+    > Client<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, N>
+{
     pub fn new(bufsize: usize, address: &str, port: &str, nflows: usize) -> Self {
         println!("buffer size {:?}, number of flows {:?}", bufsize, nflows);
 

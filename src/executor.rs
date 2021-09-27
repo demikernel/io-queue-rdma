@@ -20,20 +20,25 @@ use rdma_cm::{CompletionQueue, ProtectionDomain, QueuePair, RdmaMemory};
 use crate::control_flow::ControlFlow;
 use futures::Stream;
 use std::cmp::min;
-use std::sync::mpsc::{Receiver, Sender};
 
-pub(crate) struct Executor<const WINDOW_SIZE: usize, const SIZE: usize> {
-    tasks: Vec<ConnectionTask<WINDOW_SIZE, SIZE>>,
+pub(crate) struct Executor<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const CQ_ELEMENTS: usize,
+    const WINDOW_SIZE: usize,
+    const BUFFER_SIZE: usize,
+> {
+    tasks: Vec<ConnectionTask<RECV_WRS, SEND_WRS, WINDOW_SIZE, BUFFER_SIZE>>,
 }
 
 #[derive(Copy, Clone)]
 pub struct QueueToken {
     task_id: TaskHandle,
-    op: QueueTokenOp,
+    pub(crate) op: QueueTokenOp,
 }
 
 #[derive(Copy, Clone)]
-enum QueueTokenOp {
+pub enum QueueTokenOp {
     Push { work_id: u64 },
     Pop,
 }
@@ -64,7 +69,12 @@ impl<T, const SIZE: usize> CompletedRequest<T, SIZE> {
 
 // TODO: Currently we must make sure the protection domain is declared last as we need to deallocate
 // all other registered memory before deallocating protection domain. How to fix this?
-struct ConnectionTask<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> {
+struct ConnectionTask<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const WINDOW_SIZE: usize,
+    const BUFFER_SIZE: usize,
+> {
     memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, BUFFER_SIZE>>>>,
 
     recv_buffers_coroutine: Pin<Box<dyn Future<Output = ()>>>,
@@ -73,7 +83,7 @@ struct ConnectionTask<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> {
     completed_pops: Rc<RefCell<Vec<RdmaMemory<u8, BUFFER_SIZE>>>>,
     completed_pushes: Rc<RefCell<HashMap<u64, RdmaMemory<u8, BUFFER_SIZE>>>>,
     work_id_counter: Rc<RefCell<u64>>,
-    control_flow: Rc<RefCell<ControlFlow<{ WINDOW_SIZE }>>>,
+    control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
 
     completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     /// We keep the protection domain around to make sure it doesn't get dropped before
@@ -81,8 +91,15 @@ struct ConnectionTask<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> {
     _protection_domain: ProtectionDomain,
 }
 
-impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, BUFFER_SIZE> {
-    pub fn new() -> Executor<WINDOW_SIZE, BUFFER_SIZE> {
+impl<
+        const RECV_WRS: usize,
+        const SEND_WRS: usize,
+        const CQ_ELEMENTS: usize,
+        const WINDOW_SIZE: usize,
+        const BUFFER_SIZE: usize,
+    > Executor<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>
+{
+    pub fn new() -> Executor<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE> {
         info!(
             "{} with N={} and Size={}",
             function_name!(),
@@ -96,10 +113,10 @@ impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, B
 
     pub fn add_new_connection(
         &mut self,
-        control_flow: ControlFlow<WINDOW_SIZE>,
-        queue_pair: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
+        control_flow: ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>,
+        queue_pair: QueuePair<RECV_WRS, SEND_WRS>,
         protection_domain: ProtectionDomain,
-        completion_queue: CompletionQueue<32>,
+        completion_queue: CompletionQueue<CQ_ELEMENTS>,
     ) -> TaskHandle {
         info!("{}", function_name!());
 
@@ -193,7 +210,7 @@ impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, B
     ) -> QueueToken {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+        let task: &mut ConnectionTask<RECV_WRS, SEND_WRS, WINDOW_SIZE, BUFFER_SIZE> =
             self.tasks.get_mut(task_handle.0).unwrap();
 
         let work_id: u64 = task.work_id_counter.borrow_mut().clone();
@@ -234,10 +251,10 @@ impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, B
     pub fn poll_coroutines(&mut self, qt: QueueToken) {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+        let task: &mut ConnectionTask<RECV_WRS, SEND_WRS, WINDOW_SIZE, BUFFER_SIZE> =
             self.tasks.get_mut(qt.task_id.0).unwrap();
 
-        Executor::poll_task(task);
+        Executor::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::poll_task(task);
     }
 
     /// Poll all tasks from all connections.
@@ -245,18 +262,28 @@ impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, B
         trace!("{}", function_name!());
 
         for t in self.tasks.iter_mut() {
-            Executor::poll_task(t);
+            Executor::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::poll_task(t);
         }
     }
 
-    fn poll_task(t: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE>) {
-        Self::schedule(&mut t.push_coroutine);
-        Self::schedule(&mut t.completions_coroutine);
+    pub fn poll_completion_coroutine(
+        &mut self,
+        qt: QueueToken,
+    ) -> Option<CompletedRequest<u8, BUFFER_SIZE>> {
+        let task: &mut _ = self.tasks.get_mut(qt.task_id.0).unwrap();
+        Self::schedule(&mut task.completions_coroutine);
+        self.wait(qt)
+    }
 
-        /// Only schedule our recv buffers coroutine when receive window hits zero.
-        if t.control_flow.borrow().remaining_receive_windows() == 0 {
+    fn poll_task(t: &mut ConnectionTask<RECV_WRS, SEND_WRS, WINDOW_SIZE, BUFFER_SIZE>) {
+        Self::schedule(&mut t.push_coroutine);
+
+        // Only schedule our recv buffers coroutine when receive window hits zero.
+        if t.control_flow.borrow().remaining_receive_windows() < (WINDOW_SIZE / 2) as u64 {
+            // if t.control_flow.borrow().remaining_receive_windows() == 0 {
             Self::schedule(&mut t.recv_buffers_coroutine);
         }
+        Self::schedule(&mut t.completions_coroutine);
     }
 
     /// Checks if work corresponding to `qt` is finished returning the data. Otherwise returns
@@ -264,7 +291,7 @@ impl<const WINDOW_SIZE: usize, const BUFFER_SIZE: usize> Executor<WINDOW_SIZE, B
     pub fn wait(&mut self, qt: QueueToken) -> Option<CompletedRequest<u8, BUFFER_SIZE>> {
         trace!("{}", function_name!());
 
-        let task: &mut ConnectionTask<WINDOW_SIZE, BUFFER_SIZE> =
+        let task: &mut ConnectionTask<RECV_WRS, SEND_WRS, WINDOW_SIZE, BUFFER_SIZE> =
             self.tasks.get_mut(qt.task_id.0).unwrap();
         match qt.op {
             QueueTokenOp::Push { work_id } => task
@@ -287,12 +314,14 @@ struct WorkRequest<const SIZE: usize> {
     work_id: u64,
 }
 
-struct SendWindows<const WINDOW_SIZE: usize> {
-    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
+struct SendWindows<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize> {
+    control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
 }
 
 /// Pending until more send windows are allocated by other side.
-impl<const WINDOW_SIZE: usize> Stream for SendWindows<WINDOW_SIZE> {
+impl<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize> Stream
+    for SendWindows<RECV_WRS, SEND_WRS, WINDOW_SIZE>
+{
     type Item = u64;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -301,12 +330,15 @@ impl<const WINDOW_SIZE: usize> Stream for SendWindows<WINDOW_SIZE> {
             // Our local variable shows we have exhausted the send windows. Check if other side
             // has allocated more...
             0 => {
-                trace!("Out of send windows. Checking if other side has allocated more...");
+                info!("Out of send windows...");
 
                 // Yes. Other side _has_ allocated more receive windows. Update and we are ready.
                 let recv_windows = cf.other_side_recv_windows();
                 if recv_windows != 0 {
-                    info!("Other side has allocated more recv windows!");
+                    info!(
+                        "..Other side has allocated {} more recv windows!",
+                        recv_windows
+                    );
                     cf.remaining_send_window = recv_windows;
                     cf.ack_peer_recv_windows();
                     return Poll::Ready(Some(recv_windows));
@@ -319,10 +351,15 @@ impl<const WINDOW_SIZE: usize> Stream for SendWindows<WINDOW_SIZE> {
 }
 
 // Note: Make sure you don't hold RefCells across yield points.
-async fn push_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
-    mut queue_pairs: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
+async fn push_coroutine<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const WINDOW_SIZE: usize,
+    const SIZE: usize,
+>(
+    mut queue_pairs: QueuePair<RECV_WRS, SEND_WRS>,
     push_work: async_channel::Receiver<WorkRequest<SIZE>>,
-    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
+    control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
     processed_requests: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
 ) {
     let s = span!(Level::INFO, "push_coroutine");
@@ -368,33 +405,45 @@ async fn push_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
                 "duplicate entry"
             );
         }
-
+        s.in_scope(|| debug!("{} requests sent!", requests_number));
         control_flow
             .borrow_mut()
             .subtract_remaining_send_windows(requests_number as u64);
     }
 }
 
-struct RemainingReceiveWindows<const WINDOW_SIZE: usize> {
-    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
+struct RemainingReceiveWindows<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const WINDOW_SIZE: usize,
+> {
+    control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
 }
 
 /// Pending until more send windows are allocated by other side.
-impl<const WINDOW_SIZE: usize> Stream for RemainingReceiveWindows<WINDOW_SIZE> {
+impl<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize> Stream
+    for RemainingReceiveWindows<RECV_WRS, SEND_WRS, WINDOW_SIZE>
+{
     type Item = u64;
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let cf = self.control_flow.deref().borrow();
         match cf.remaining_receive_windows() {
-            0 => Poll::Ready(Some(WINDOW_SIZE as u64)),
+            // 0 => Poll::Ready(Some(WINDOW_SIZE as u64)),
+            n if WINDOW_SIZE / 2 > n as usize => Poll::Ready(Some(WINDOW_SIZE as u64)),
             _ => Poll::Pending,
         }
     }
 }
 
-async fn receive_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
-    mut queue_pair: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
-    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
+async fn receive_coroutine<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const WINDOW_SIZE: usize,
+    const SIZE: usize,
+>(
+    mut queue_pair: QueuePair<RECV_WRS, SEND_WRS>,
+    control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
     // Reference to our Executor's memory poll. We take entries for here for our post_receive RDMA
     // operation.
     memory_pool: Rc<RefCell<VecDeque<RdmaMemory<u8, SIZE>>>>,
@@ -440,7 +489,7 @@ async fn receive_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
             debug!(
                 "Work ids {} through {} are ready.",
                 work_id,
-                work_id + how_many
+                work_id + how_many - 1 // -1
             )
         });
 
@@ -457,11 +506,13 @@ async fn receive_coroutine<const WINDOW_SIZE: usize, const SIZE: usize>(
 }
 
 async fn completions_coroutine<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
     const WINDOW_SIZE: usize,
     const CQ_MAX_ELEMENTS: usize,
     const SIZE: usize,
 >(
-    control_flow: Rc<RefCell<ControlFlow<WINDOW_SIZE>>>,
+    control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
     cq: CompletionQueue<CQ_MAX_ELEMENTS>,
     completed_pushes: Rc<RefCell<HashMap<u64, RdmaMemory<u8, SIZE>>>>,
     completed_pops: Rc<RefCell<Vec<RdmaMemory<u8, SIZE>>>>,
@@ -482,7 +533,7 @@ async fn completions_coroutine<
             .await
             .expect("Our stream should never end.");
 
-        s.in_scope(|| debug!("{} events completed!.", completed.len()));
+        s.in_scope(|| info!("{} events completed!.", completed.len()));
 
         let mut recv_requests_completed = 0;
         let mut completed_pops = completed_pops.borrow_mut();
@@ -526,7 +577,7 @@ async fn completions_coroutine<
             .borrow_mut()
             .subtract_recv_windows(recv_requests_completed);
 
-        /// Needed otherwise we would be awaiting while still holding RefCells.
+        // Needed otherwise we would be awaiting while still holding RefCells.
         drop(completed_pops);
         drop(completed_pushes);
         drop(processed_requests);

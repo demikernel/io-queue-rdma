@@ -6,7 +6,7 @@ use rdma_cm::{
     CommunicationManager, PeerConnectionData, RdmaCmEvent, RdmaMemory, VolatileRdmaMemory,
 };
 
-use crate::executor::{Executor, TaskHandle};
+use crate::executor::{Executor, QueueTokenOp, TaskHandle};
 use control_flow::ControlFlow;
 pub use executor::{CompletedRequest, QueueToken};
 
@@ -23,12 +23,25 @@ pub struct QueueDescriptor {
     scheduler_handle: Option<TaskHandle>,
 }
 
-pub struct IoQueue<const WINDOW_SIZE: usize, const N: usize> {
-    executor: executor::Executor<WINDOW_SIZE, N>,
+pub struct IoQueue<
+    const RECV_WRS: usize,
+    const SEND_WRS: usize,
+    const CQ_ELEMENTS: usize,
+    const WINDOW_SIZE: usize,
+    const BUFFER_SIZE: usize,
+> {
+    executor: executor::Executor<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>,
 }
 
-impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
-    pub fn new() -> IoQueue<WINDOW_SIZE, N> {
+impl<
+        const RECV_WRS: usize,
+        const SEND_WRS: usize,
+        const CQ_ELEMENTS: usize,
+        const WINDOW_SIZE: usize,
+        const BUFFER_SIZE: usize,
+    > IoQueue<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>
+{
+    pub fn new() -> IoQueue<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE> {
         info!("{}", function_name!());
         IoQueue {
             executor: Executor::new(),
@@ -61,7 +74,9 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
     pub fn connect(&mut self, qd: &mut QueueDescriptor, node: &str, service: &str) {
         info!("{}", function_name!());
 
-        IoQueue::<WINDOW_SIZE, N>::resolve_address(qd, node, service);
+        IoQueue::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::resolve_address(
+            qd, node, service,
+        );
 
         // Resolve route
         qd.cm.resolve_route(1).expect("TODO");
@@ -179,7 +194,7 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
 
     /// Fetch a buffer from our pre-allocated memory pool.
     /// TODO: This function should only be called once the protection domain has been allocated.
-    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RdmaMemory<u8, N> {
+    pub fn malloc(&mut self, qd: &mut QueueDescriptor) -> RdmaMemory<u8, BUFFER_SIZE> {
         trace!("{}", function_name!());
 
         // TODO Do proper error handling. This expect means the connection was never properly
@@ -188,7 +203,7 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
             .malloc(qd.scheduler_handle.expect("Missing executor handle."))
     }
 
-    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RdmaMemory<u8, N>) {
+    pub fn free(&mut self, qd: &mut QueueDescriptor, memory: RdmaMemory<u8, BUFFER_SIZE>) {
         trace!("{}", function_name!());
         // TODO Do proper error handling. This expect means the connection was never properly
         // established via accept or connect. So we never added it to the executor.
@@ -202,7 +217,11 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
     /// RDMA on behalf of the user.
     /// TODO: If user drops QueueToken we will be pointing to dangling memory... We should reference
     /// count he memory ourselves...
-    pub fn push(&mut self, qd: &mut QueueDescriptor, mem: RdmaMemory<u8, N>) -> QueueToken {
+    pub fn push(
+        &mut self,
+        qd: &mut QueueDescriptor,
+        mem: RdmaMemory<u8, BUFFER_SIZE>,
+    ) -> QueueToken {
         trace!("{}", function_name!());
 
         let error = "Passed queue descriptor has no scheduler associated wit it!\
@@ -219,27 +238,54 @@ impl<const WINDOW_SIZE: usize, const N: usize> IoQueue<WINDOW_SIZE, N> {
         self.executor.pop(qd.scheduler_handle.unwrap())
     }
 
-    pub fn wait(&mut self, qt: QueueToken) -> CompletedRequest<u8, N> {
+    pub fn wait(&mut self, qt: QueueToken) -> CompletedRequest<u8, BUFFER_SIZE> {
         trace!("{}", function_name!());
         loop {
             match self.executor.wait(qt) {
-                None => {
-                    self.executor.poll_coroutines(qt);
-                }
+                None => match self.executor.poll_completion_coroutine(qt) {
+                    None => self.executor.poll_coroutines(qt),
+                    Some(cr) => return cr,
+                },
                 Some(cr) => return cr,
             }
         }
+        // loop {
+        //     match self.executor.wait(qt) {
+        //         None => {
+        //             self.executor.poll_coroutines(qt);
+        //         }
+        //         Some(cr) => return cr,
+        //     }
+        // }
     }
 
-    pub fn wait_any(&mut self, qts: &[QueueToken]) -> (usize, CompletedRequest<u8, N>) {
+    pub fn wait_any(&mut self, qts: &[QueueToken]) -> (usize, CompletedRequest<u8, BUFFER_SIZE>) {
         trace!("{}", function_name!());
+
+        let mut pops_checked: bool = false;
         loop {
             for (i, qt) in qts.iter().enumerate() {
-                if let Some(completed_op) = self.executor.wait(*qt) {
-                    return (i, completed_op);
+                match qt.op {
+                    QueueTokenOp::Push { .. } => {
+                        if let Some(completed_op) = self.executor.wait(*qt) {
+                            return (i, completed_op);
+                        }
+                    }
+                    QueueTokenOp::Pop => {
+                        if pops_checked {
+                            continue;
+                        } else {
+                            if let Some(completed_op) = self.executor.wait(*qt) {
+                                return (i, completed_op);
+                            } else {
+                                pops_checked = true;
+                            }
+                        }
+                    }
                 }
             }
             self.executor.poll_all_tasks();
+            pops_checked = false;
         }
     }
 

@@ -43,6 +43,9 @@ struct Opt {
     memory_size: usize,
 }
 
+const RECV_WRS: usize = 2048;
+const SEND_WRS: usize = 256;
+const CQ_ELEMENTS: usize = 256;
 const WINDOW_SIZE: usize = 1024;
 const BUFFER_SIZE: usize = 1024;
 
@@ -58,7 +61,8 @@ fn main() {
     let address: SocketAddr = address.parse().expect("Unable to parse socket address");
     match opt.mode {
         Mode::Server => {
-            let mut io_queue = IoQueue::<WINDOW_SIZE, BUFFER_SIZE>::new();
+            let mut io_queue =
+                IoQueue::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::new();
             let mut listening_qd = io_queue.socket();
 
             io_queue
@@ -85,7 +89,8 @@ fn main() {
             io_queue.disconnect(connected_qd);
         }
         Mode::Client => {
-            let mut io_queue = IoQueue::<WINDOW_SIZE, BUFFER_SIZE>::new();
+            let mut io_queue =
+                IoQueue::<RECV_WRS, SEND_WRS, CQ_ELEMENTS, WINDOW_SIZE, BUFFER_SIZE>::new();
             let mut connection = io_queue.socket();
             io_queue.connect(&mut connection, &opt.ip_address, &opt.port);
 

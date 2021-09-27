@@ -4,7 +4,7 @@ use std::array::IntoIter;
 #[allow(unused_imports)]
 use tracing::{debug, info, span, trace, Level};
 
-pub struct ControlFlow<const WINDOW_SIZE: usize> {
+pub struct ControlFlow<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize> {
     /// Amount of allocated buffers left for receive requests.
     remaining_receive_window: u64,
     /// Amount of allocated buffers left on the other side. This is our local variable used
@@ -19,24 +19,28 @@ pub struct ControlFlow<const WINDOW_SIZE: usize> {
     /// new receive windows.
     other_side: PeerConnectionData<u64, 1>,
     /// Queue pair for this connection. Used for RDMA reads and writes.
-    qp: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
+    qp: QueuePair<RECV_WRS, SEND_WRS>,
     /// One sided RDMA requires somewhere to read and write from. We use this memory.
     memory: Option<RdmaMemory<u64, 1>>,
 }
 
-impl<const WINDOW_SIZE: usize> Drop for ControlFlow<WINDOW_SIZE> {
+impl<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize> Drop
+    for ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>
+{
     fn drop(&mut self) {
         debug!("{}", crate::function_name!());
     }
 }
 
-impl<const WINDOW_SIZE: usize> ControlFlow<WINDOW_SIZE> {
+impl<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize>
+    ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>
+{
     pub fn new(
-        qp: QueuePair<WINDOW_SIZE, WINDOW_SIZE>,
+        qp: QueuePair<RECV_WRS, SEND_WRS>,
         memory: RdmaMemory<u64, 1>,
         volatile_receive_window: VolatileRdmaMemory<u64, 1>,
         other_side: PeerConnectionData<u64, 1>,
-    ) -> ControlFlow<WINDOW_SIZE> {
+    ) -> ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE> {
         ControlFlow {
             remaining_receive_window: 0,
             // Other side will allocate same number of buffers we do.
@@ -77,7 +81,7 @@ impl<const WINDOW_SIZE: usize> ControlFlow<WINDOW_SIZE> {
     /// Receive windows should only be added when we hit zero?
     pub fn add_recv_windows(&mut self, how_many: u64) {
         tracing::info!("add_recv_windows(how_many={})!", how_many);
-        assert_eq!(self.remaining_receive_window, 0);
+        // assert_eq!(self.remaining_receive_window, 0);
         self.remaining_receive_window += how_many;
 
         let mut memory = self.memory.take().unwrap();
