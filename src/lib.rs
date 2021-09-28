@@ -6,7 +6,7 @@ use rdma_cm::{
     CommunicationManager, PeerConnectionData, RdmaCmEvent, RdmaMemory, VolatileRdmaMemory,
 };
 
-use crate::executor::{Executor, QueueTokenOp, TaskHandle};
+use crate::executor::{Executor, QueueTokenOp, TaskHandle, TIME};
 use control_flow::ControlFlow;
 pub use executor::{CompletedRequest, QueueToken};
 
@@ -14,6 +14,7 @@ mod control_flow;
 mod executor;
 mod utils;
 mod waker;
+use std::borrow::BorrowMut;
 #[allow(unused_imports)]
 use tracing::{debug, info, trace, Level};
 
@@ -257,6 +258,14 @@ impl<
         //         Some(cr) => return cr,
         //     }
         // }
+    }
+
+    pub fn get_and_reset_time(&mut self) -> u32 {
+        TIME.with(|time| {
+            let current = *time.borrow_mut();
+            *time.borrow_mut() = 0;
+            current
+        })
     }
 
     pub fn wait_any(&mut self, qts: &[QueueToken]) -> (usize, CompletedRequest<u8, BUFFER_SIZE>) {

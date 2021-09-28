@@ -20,6 +20,7 @@ use rdma_cm::{CompletionQueue, ProtectionDomain, QueuePair, RdmaMemory};
 use crate::control_flow::ControlFlow;
 use futures::Stream;
 use std::cmp::min;
+use std::time::Instant;
 
 pub(crate) struct Executor<
     const RECV_WRS: usize,
@@ -67,6 +68,10 @@ impl<T, const SIZE: usize> CompletedRequest<T, SIZE> {
     }
 }
 
+thread_local! {
+    pub static TIME: RefCell<u32> = RefCell::new(0);
+}
+
 // TODO: Currently we must make sure the protection domain is declared last as we need to deallocate
 // all other registered memory before deallocating protection domain. How to fix this?
 struct ConnectionTask<
@@ -84,7 +89,6 @@ struct ConnectionTask<
     completed_pushes: Rc<RefCell<HashMap<u64, RdmaMemory<u8, BUFFER_SIZE>>>>,
     work_id_counter: Rc<RefCell<u64>>,
     control_flow: Rc<RefCell<ControlFlow<RECV_WRS, SEND_WRS, WINDOW_SIZE>>>,
-
     completions_coroutine: Pin<Box<dyn Future<Output = ()>>>,
     /// We keep the protection domain around to make sure it doesn't get dropped before
     /// everything else.
@@ -146,7 +150,7 @@ impl<
                 control_flow.clone(),
                 processed_requests.clone(),
             )),
-            recv_buffers_coroutine: Box::pin(receive_coroutine(
+            recv_buffers_coroutine: Box::pin(recv_buffers_coroutine(
                 queue_pair,
                 control_flow.clone(),
                 memory_pool,
@@ -208,6 +212,7 @@ impl<
         task_handle: TaskHandle,
         memory: RdmaMemory<u8, BUFFER_SIZE>,
     ) -> QueueToken {
+        let time = Instant::now();
         trace!("{}", function_name!());
 
         let task: &mut ConnectionTask<RECV_WRS, SEND_WRS, WINDOW_SIZE, BUFFER_SIZE> =
@@ -222,6 +227,8 @@ impl<
             .expect("Channel should never be full or dropped.");
         Self::schedule(&mut task.push_coroutine);
 
+        let elapsed = time.elapsed().as_nanos();
+        TIME.with(|time| *time.borrow_mut() += elapsed as u32);
         QueueToken {
             task_id: task_handle,
             op: QueueTokenOp::Push { work_id },
@@ -436,7 +443,7 @@ impl<const RECV_WRS: usize, const SEND_WRS: usize, const WINDOW_SIZE: usize> Str
     }
 }
 
-async fn receive_coroutine<
+async fn recv_buffers_coroutine<
     const RECV_WRS: usize,
     const SEND_WRS: usize,
     const WINDOW_SIZE: usize,
@@ -532,7 +539,7 @@ async fn completions_coroutine<
             .next()
             .await
             .expect("Our stream should never end.");
-
+        let time = Instant::now();
         s.in_scope(|| info!("{} events completed!.", completed.len()));
 
         let mut recv_requests_completed = 0;
@@ -555,6 +562,8 @@ async fn completions_coroutine<
                 let bytes_transferred = c.byte_len as usize;
                 memory.initialize_length(bytes_transferred);
                 completed_pops.push(memory);
+                let elapsed = time.elapsed();
+                TIME.with(|time| *time.borrow_mut() += elapsed.as_nanos() as u32);
             } else if c.opcode == rdma_cm::ffi::ibv_wc_opcode_IBV_WC_SEND {
                 let memory = processed_requests.remove(&c.wr_id).
                     // This should be impossible.
@@ -601,7 +610,7 @@ impl Yield {
 impl Future for Yield {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.yield_first_time {
             self.yield_first_time = false;
             Poll::Pending

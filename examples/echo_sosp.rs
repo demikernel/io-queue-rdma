@@ -113,7 +113,7 @@ impl<
         let mut qtokens: Vec<QueueToken> = Vec::with_capacity(10000);
         let mut connected_qd = self.libos.accept(&mut self.listening_qd);
 
-        let mut bufsize: usize = 0;
+        // let mut bufsize: usize = 0;
         // let mut start: Instant = Instant::now();
         let mut every_second_timer: Instant = Instant::now();
         let mut processed_packages: usize = 0;
@@ -128,7 +128,7 @@ impl<
                 dbg!(&processed_packages);
                 println!(
                     "{} gbps",
-                    (processed_packages * 2 * 1024 * 8) as f64 / (1024 * 1024 * 1024) as f64
+                    (processed_packages * 2 * 1024 * 8) as f64 / (1_000_000_000) as f64
                 );
                 processed_packages = 0;
                 every_second_timer = Instant::now();
@@ -139,7 +139,7 @@ impl<
 
             match result {
                 CompletedRequest::Pop(memory) => {
-                    bufsize = memory.accessed();
+                    // bufsize = memory.accessed();
                     let qt = self.libos.push(&mut connected_qd, memory);
                     qtokens.push(qt);
                     processed_packages += 1;
@@ -203,6 +203,7 @@ impl<
         let mut qtokens: Vec<QueueToken> = Vec::with_capacity(10000);
         let mut packet_times: HashMap<u64, Instant> = HashMap::with_capacity(10000);
         let mut last_log = Instant::now();
+        let mut processed_packages: usize = 0;
 
         // Send initial packets.
         for _ in 0..self.nflows {
@@ -219,6 +220,15 @@ impl<
             // Dump statistics.
             if last_log.elapsed() > Duration::from_secs(1) {
                 self.stats.print();
+
+                let total_io = self.libos.get_and_reset_time() as u64;
+                println!(
+                    "libOS time ({:?}) / processed_packages ({:?}) = {:?}",
+                    Duration::from_nanos(total_io as u64),
+                    processed_packages,
+                    Duration::from_nanos((total_io as f64 / processed_packages as f64) as u64),
+                );
+                processed_packages = 0;
                 last_log = Instant::now();
             }
 
@@ -247,6 +257,7 @@ impl<
 
                     let qt = self.libos.pop(&mut self.qd);
                     qtokens.push(qt);
+                    processed_packages += 1;
                 }
             }
         }

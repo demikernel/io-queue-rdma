@@ -46,15 +46,15 @@ impl Statistics {
         }
     }
 
-    fn latency01(&self) -> Duration {
-        let median = self.times.percentile(0.01).unwrap();
-        Duration::from_nanos(median)
-    }
-
-    fn latency99(&self) -> Duration {
-        let median = self.times.percentile(0.99).unwrap();
-        Duration::from_nanos(median)
-    }
+    // fn latency01(&self) -> Duration {
+    //     let median = self.times.percentile(0.01).unwrap();
+    //     Duration::from_nanos(median)
+    // }
+    //
+    // fn latency99(&self) -> Duration {
+    //     let median = self.times.percentile(0.99).unwrap();
+    //     Duration::from_nanos(median)
+    // }
 
     pub fn print(&self) {
         if self.times.entries() > 0 {
