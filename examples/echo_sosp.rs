@@ -110,12 +110,13 @@ impl<
     }
 
     pub fn run(&mut self) {
-        let mut qtokens: Vec<QueueToken> = Vec::new();
+        let mut qtokens: Vec<QueueToken> = Vec::with_capacity(10000);
         let mut connected_qd = self.libos.accept(&mut self.listening_qd);
 
         let mut bufsize: usize = 0;
-        let mut start: Instant = Instant::now();
-        let mut last_log: Instant = Instant::now();
+        // let mut start: Instant = Instant::now();
+        let mut every_second_timer: Instant = Instant::now();
+        let mut processed_packages: usize = 0;
 
         // Wait for client to write to us.
         let qt = self.libos.pop(&mut connected_qd);
@@ -123,30 +124,30 @@ impl<
 
         loop {
             // Dump statistics.
-            if last_log.elapsed() > Duration::from_secs(5) {
-                self.stats.print();
-
-                last_log = Instant::now();
+            if every_second_timer.elapsed() > Duration::from_secs(1) {
+                println!(
+                    "{} gbps",
+                    (processed_packages * 2 * 1024 * 8) as f64 / (1024 * 1024 * 1024) as f64
+                );
+                processed_packages = 0;
+                every_second_timer = Instant::now();
             }
 
-            // let wait_start = Instant::now();
             let (i, result) = self.libos.wait_any(&qtokens);
             qtokens.swap_remove(i);
 
             match result {
                 CompletedRequest::Pop(memory) => {
                     bufsize = memory.accessed();
-
-                    // let push = Instant::now();
                     let qt = self.libos.push(&mut connected_qd, memory);
+                    qtokens.push(qt);
+                    processed_packages += 1;
+
+                    // Allow other pop if available for us to serve.
+                    let qt = self.libos.pop(&mut connected_qd);
                     qtokens.push(qt);
                 }
                 CompletedRequest::Push(memory) => {
-                    self.stats.record(2 * bufsize, start.elapsed());
-                    start = Instant::now();
-
-                    let qt = self.libos.pop(&mut connected_qd);
-                    qtokens.push(qt);
                     self.libos.free(&mut connected_qd, memory);
                 }
             }
@@ -198,8 +199,8 @@ impl<
 
     fn client(&mut self) {
         // Preallocate to avoid heap allocation during measurements.
-        let mut qtokens: Vec<QueueToken> = Vec::with_capacity(1000);
-        let mut packet_times: HashMap<u64, Instant> = HashMap::with_capacity(1000);
+        let mut qtokens: Vec<QueueToken> = Vec::with_capacity(10000);
+        let mut packet_times: HashMap<u64, Instant> = HashMap::with_capacity(10000);
         let mut last_log = Instant::now();
 
         // Send initial packets.
