@@ -125,6 +125,7 @@ impl<
         loop {
             // Dump statistics.
             if every_second_timer.elapsed() > Duration::from_secs(1) {
+                dbg!(&processed_packages);
                 println!(
                     "{} gbps",
                     (processed_packages * 2 * 1024 * 8) as f64 / (1024 * 1024 * 1024) as f64
@@ -210,11 +211,13 @@ impl<
 
             let qt = self.libos.push(&mut self.qd, buf);
             qtokens.push(qt);
+            let qt = self.libos.pop(&mut self.qd);
+            qtokens.push(qt);
         }
 
         loop {
             // Dump statistics.
-            if last_log.elapsed() > Duration::from_secs(5) {
+            if last_log.elapsed() > Duration::from_secs(1) {
                 self.stats.print();
                 last_log = Instant::now();
             }
@@ -224,8 +227,6 @@ impl<
 
             match result {
                 CompletedRequest::Push(memory) => {
-                    let qt = self.libos.pop(&mut self.qd);
-                    qtokens.push(qt);
                     self.libos.free(&mut self.qd, memory);
                 }
                 CompletedRequest::Pop(memory) => {
@@ -240,7 +241,11 @@ impl<
                     // Send another packet.
                     let (buf, stamp) = self.makepkt(self.bufsize);
                     packet_times.insert(stamp, Instant::now());
+
                     let qt = self.libos.push(&mut self.qd, buf);
+                    qtokens.push(qt);
+
+                    let qt = self.libos.pop(&mut self.qd);
                     qtokens.push(qt);
                 }
             }
