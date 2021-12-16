@@ -125,6 +125,7 @@ impl<
         loop {
             // Dump statistics.
             if every_second_timer.elapsed() > Duration::from_secs(1) {
+                self.libos.get_and_reset_time();
                 dbg!(&processed_packages);
                 println!(
                     "{} gbps",
